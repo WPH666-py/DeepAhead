@@ -29,7 +29,7 @@
     "active": true,
     "targets": ["nsis"],
     "icon": [
-      "icons/DeepAhead.ico"
+      "icons/deepAhead.ico"
     ],
     "resources": [
       "tools/file-ops/*",
@@ -48,7 +48,7 @@
     "windows": {
       "nsis": {
         "installMode": "currentUser",
-        "installerIcon": "icons/DeepAhead.ico"
+        "installerIcon": "icons/deepAhead.ico"
       }
     }
   }
