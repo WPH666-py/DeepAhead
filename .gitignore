@@ -7,6 +7,9 @@ dist/
 src-tauri/target/
 src-tauri/gen/
 
+# 发行产物（安装包存放于 GitHub Releases，不进入仓库）
+release/
+
 # 运行时数据
 .webview2-data/
 
