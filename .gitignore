@@ -1,0 +1,19 @@
+# 依赖
+node_modules/
+.pnpm-store/
+
+# 构建产物
+dist/
+src-tauri/target/
+src-tauri/gen/
+
+# 运行时数据
+.webview2-data/
+
+# 捆绑的 Python 运行时
+src-tauri/python/
+
+# 系统文件
+.DS_Store
+Thumbs.db
+*.log

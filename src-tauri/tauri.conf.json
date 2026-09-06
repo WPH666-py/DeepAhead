@@ -1,0 +1,55 @@
+{
+  "$schema": "https://raw.githubusercontent.com/nicovrc/tauri-v2-schema/main/tauri.conf.json",
+  "productName": "DeepAhead",
+  "version": "0.2.0",
+  "identifier": "com.deepking.deepahead",
+  "build": {
+    "beforeDevCommand": "pnpm dev",
+    "devUrl": "http://localhost:3050",
+    "beforeBuildCommand": "pnpm build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "DeepAhead",
+        "width": 1400,
+        "height": 900,
+        "minWidth": 900,
+        "minHeight": 600,
+        "resizable": true,
+        "fullscreen": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "icon": [
+      "icons/DeepAhead.ico"
+    ],
+    "resources": [
+      "tools/file-ops/*",
+      "python/*.exe",
+      "python/*.dll",
+      "python/*.pyd",
+      "python/*.zip",
+      "python/*._pth",
+      "python/*.cat",
+      "python/*.txt",
+      "python/Lib/site-packages/pymupdf/*.py",
+      "python/Lib/site-packages/pymupdf/*.pyd",
+      "python/Lib/site-packages/pymupdf/*.dll",
+      "python/Lib/site-packages/pymupdf/py.typed"
+    ],
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "installerIcon": "icons/DeepAhead.ico"
+      }
+    }
+  }
+}

@@ -1,0 +1,36 @@
+[package]
+name = "deepahead"
+version = "0.2.0"
+edition = "2021"
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-shell = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
+tauri-plugin-clipboard-manager = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+regex = "1"
+chrono = { version = "0.4", features = ["serde"] }
+dirs-next = "2"
+glob = "0.3"
+futures-util = "0.3"
+encoding_rs = "0.8"
+calamine = "0.26"
+zip = "2"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
+[profile.release]
+lto = false
+codegen-units = 8
+opt-level = 1
+debug = false

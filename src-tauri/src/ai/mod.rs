@@ -1,0 +1,24 @@
+pub mod deepseek;
+pub mod modes;
+pub mod agents;
+pub mod hooks;
+pub mod context;
+pub mod tools;
+pub mod agent_loop;
+pub mod workflow;
+pub mod file_parser;
+pub mod vision;
+pub mod undo;
+pub mod approval;
+
+pub use deepseek::{DeepSeekClient, DeepSeekConfig, Message, ChatResponse};
+pub use modes::{ModeMeta, ContextFile, build_system_prompt, native_system_prompt, engine_info, list_modes, meta};
+pub use agents::AgentDefinition;
+pub use hooks::{SafetyHooks, HookRule, HookAction, HookResult};
+pub use context::{ContextCompressor, CompressorConfig, CompressedMessage};
+pub use tools::{ToolRegistry, ToolCall, ToolResult, ToolSchema, TodoItem, detect_runtimes};
+pub use agent_loop::{run_agent_loop, AgentEvent, AgentEventKind, AgentLoopInput, AgentLoopOutput, LoopConfig};
+pub use approval::{ApprovalGate, ApprovalMode};
+pub use file_parser::{parse_file, parse_files, ParsedFile, bundled_python, python_interpreter};
+pub use undo::{UndoEntry, UndoStore, apply_undo};
+pub use vision::{VisionConfig, VisionResult, analyze_image, read_image, set_config as set_vision_config, get_config as get_vision_config, is_configured as vision_is_configured};
