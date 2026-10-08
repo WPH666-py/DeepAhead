@@ -15,7 +15,7 @@ pub use deepseek::{DeepSeekClient, DeepSeekConfig, Message, ChatResponse};
 pub use modes::{ModeMeta, ContextFile, build_system_prompt, native_system_prompt, engine_info, list_modes, meta};
 pub use agents::AgentDefinition;
 pub use hooks::{SafetyHooks, HookRule, HookAction, HookResult};
-pub use context::{ContextCompressor, CompressorConfig, CompressedMessage};
+pub use context::{ContextCompressor, CompressorConfig, CompressedMessage, DEFAULT_CONTEXT_LIMIT};
 pub use tools::{ToolRegistry, ToolCall, ToolResult, ToolSchema, TodoItem, detect_runtimes};
 pub use agent_loop::{run_agent_loop, AgentEvent, AgentEventKind, AgentLoopInput, AgentLoopOutput, LoopConfig};
 pub use approval::{ApprovalGate, ApprovalMode};

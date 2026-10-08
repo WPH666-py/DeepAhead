@@ -12,6 +12,35 @@ function newMsgId(): string {
   return `m_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
 }
 
+// ─── 日志（"日志"面板数据源）───
+export type LogKind = "mode" | "question" | "answer" | "tool" | "system" | "context";
+export interface LogEntry {
+  id: string;
+  ts: number;
+  kind: LogKind;
+  title: string;
+  detail?: string;
+}
+
+// ─── 上下文占用 ───
+/** 上下文占用达到该比例时提示/自动压缩 */
+export const CONTEXT_WARN_RATIO = 0.85;
+export const DEFAULT_CONTEXT_LIMIT = 128000;
+
+// ─── 输入区图片 ───
+/** 每次提问最多可附加的图片数 */
+export const MAX_PASTE_IMAGES = 6;
+export interface ImageAttachment { path: string; preview: string; name: string; }
+
+/** 日志中的参数美化（JSON 字符串 → 缩进 JSON），只读取叶子字段，避免序列化运行时对象 */
+function formatLogArgs(args: unknown): string {
+  if (args == null) return "(无参数)";
+  if (typeof args === "string") {
+    try { return JSON.stringify(JSON.parse(args), null, 2); } catch { return args; }
+  }
+  try { return JSON.stringify(args, null, 2); } catch { return String(args); }
+}
+
 export const useAppStore = defineStore("app", () => {
   const currentProject = ref<string | null>(null);
   const currentMode = ref<string>("dsh");
@@ -37,6 +66,35 @@ export const useAppStore = defineStore("app", () => {
   const lastContextTokens = ref(0);
   // 每条用户消息触发的 Agent 运行 ID（撤回对话时按 run 回滚文件变更）
   const runIdsByUserMsg = new Map<string, string>();
+
+  // ─── 上下文占用比例 + 压缩（自动 / 手动）───
+  // contextLimit：模型上下文窗口（Token）；contextTokens：当前对话占用（实时估算）
+  const contextLimit = ref<number>(Number(localStorage.getItem("deep-ide-context-limit")) || DEFAULT_CONTEXT_LIMIT);
+  const contextTokens = ref(0);
+  // 压缩模式："auto" = 超过 85% 自动压缩用户上下文（不清空对话）；"manual" = 仅提示用户手动压缩
+  const compressionMode = ref<"auto" | "manual">(
+    (localStorage.getItem("deep-ide-compression-mode") as "auto" | "manual") || "manual"
+  );
+  /** 当前占用比例 0~1 */
+  const contextRatio = computed(() =>
+    contextLimit.value > 0 ? Math.min(contextTokens.value / contextLimit.value, 1) : 0
+  );
+  /** 是否已达到提示阈值（85%） */
+  const contextWarning = computed(() => contextRatio.value >= CONTEXT_WARN_RATIO);
+  const contextPercent = computed(() => Math.round(contextRatio.value * 1000) / 10);
+
+  // ─── 日志：模式切换 / 每轮提问与回复 / 工具调用 / 操作过程 ───
+  const sessionLogs = ref<LogEntry[]>([]);
+  function appendLog(kind: LogKind, title: string, detail?: string) {
+    sessionLogs.value.push({ id: newMsgId(), ts: Date.now(), kind, title, detail });
+    // 防止无限增长（保留最近 2000 条）
+    if (sessionLogs.value.length > 2000) sessionLogs.value.splice(0, sessionLogs.value.length - 2000);
+  }
+  function clearLogs() { sessionLogs.value = []; }
+
+  // ─── 待发送的粘贴图片（每次提问最多 MAX_PASTE_IMAGES 张）───
+  // preview 用于缩略图展示，path 用于发送时交给视觉引擎识别
+  const pastedImages = ref<ImageAttachment[]>([]);
 
   // Agent Loop 工具调用追踪
   const toolCalls = ref<Array<{
@@ -105,8 +163,17 @@ export const useAppStore = defineStore("app", () => {
     modeInfoLoading.value = true;
     try {
       modeInfo.value = await tauriAPI.switchAIMode(mode);
+      const name = modeInfo.value?.name || mode.toUpperCase();
+      appendLog(
+        "mode",
+        `切换模式 → ${name}`,
+        [modeInfo.value?.engine, modeInfo.value?.upstream, modeInfo.value?.mechanism]
+          .filter(Boolean)
+          .join(" · ") || undefined
+      );
     } catch (e: any) {
       addSystemMessage(`模式切换失败: ${e}`);
+      appendLog("mode", `模式切换失败 → ${mode}`, String(e));
     } finally {
       modeInfoLoading.value = false;
     }
@@ -161,23 +228,35 @@ export const useAppStore = defineStore("app", () => {
       clearTimeout(streamWatchdog);
       // 流式 completion 后，content 从 event 中积累
       messages.value[msgIndex].content = streamingContent.value;
+      appendLog("answer", `AI 回复（${currentMode.value.toUpperCase()} 模式）`, streamingContent.value);
     } catch (e: any) {
       streamSettled = true;
       clearTimeout(streamWatchdog);
       messages.value[msgIndex].content = `错误: ${e}`;
+      appendLog("system", "AI 回复失败", String(e));
     } finally {
       isLoading.value = false;
     }
   }
 
   // ─── 发送消息（带 9 个工具的 Agent Loop）───
-  async function sendMessageWithTools(content: string, contextPaths: string[] = [], workingDir?: string) {
+  /**
+   * @param requestOverride 直接发送给模型的完整提示词（用于图片识别结果等预先组装的内容）；
+   *                        不传则根据 content 自动判定是否需要"写文档"后缀
+   */
+  async function sendMessageWithTools(
+    content: string,
+    contextPaths: string[] = [],
+    workingDir?: string,
+    requestOverride?: string
+  ) {
     if (!content.trim()) return;
     if (!apiKey.value) {
       addSystemMessage("请先配置 DeepSeek API Key");
       return;
     }
 
+    appendLog("question", content, contextPaths.length ? `上下文文件：\n${contextPaths.join("\n")}` : undefined);
     const userMsg: Message = { id: newMsgId(), role: "user", content, type: "user" };
     messages.value.push(userMsg);
     isLoading.value = true;
@@ -205,9 +284,10 @@ export const useAppStore = defineStore("app", () => {
       /函数|class|接口|\bapi\b/, /\bprogram|\bscript/
     ];
     const isCodeRequest = codeGenPatterns.some(p => p.test(content.toLowerCase()));
-    const requestContent = isCodeRequest
-      ? content
-      : `${content}\n\n[System] 本次请求不涉及代码生成。请把回答整理成 Markdown 文档并保存到工作区，文件名要反映主题。最终回复中只给出文件路径和简要说明，不要输出大段正文。`;
+    const requestContent = requestOverride
+      ?? (isCodeRequest
+        ? content
+        : `${content}\n\n[System] 本次请求不涉及代码生成。请把回答整理成 Markdown 文档并保存到工作区，文件名要反映主题。最终回复中只给出文件路径和简要说明，不要输出大段正文。`);
 
     // 防"思考中"卡死：事件后若 IPC 在超时内未返回，强制恢复界面
     let invokeSettled = false;
@@ -251,6 +331,7 @@ export const useAppStore = defineStore("app", () => {
               id: k.id, name: k.name, arguments: k.arguments,
               status: "running"
             });
+            appendLog("tool", `调用工具 ${k.name}`, formatLogArgs(k.arguments));
           } else if (k.type === "tool_approval_required") {
             // 需分步确认：弹出审批卡片，工具卡片进入等待态
             const t = toolCalls.value.find(t => t.id === k.id);
@@ -264,6 +345,7 @@ export const useAppStore = defineStore("app", () => {
               });
             }
             pendingApproval.value = { approvalId: k.approval_id, toolId: k.id, name: k.name, arguments: k.arguments };
+            appendLog("tool", `等待批准：${k.name}`, formatLogArgs(k.arguments));
           } else if (k.type === "tool_approval_resolved") {
             // 审批结果：批准 → 执行中；拒绝 → 记录拒绝
             const t = toolCalls.value.find(t => t.id === k.id);
@@ -274,6 +356,7 @@ export const useAppStore = defineStore("app", () => {
             if (pendingApproval.value && pendingApproval.value.toolId === k.id) {
               pendingApproval.value = null;
             }
+            appendLog("tool", k.approved ? "✅ 已批准执行" : "⛔ 用户拒绝执行");
           } else if (k.type === "tool_call_executed") {
             const tc = toolCalls.value.find(t => t.id === k.id);
             if (tc) {
@@ -281,17 +364,32 @@ export const useAppStore = defineStore("app", () => {
               tc.output = k.output;
               tc.status = k.success ? "done" : "error";
             }
+            appendLog(
+              "tool",
+              `${k.success ? "✓" : "✗"} ${k.name} 执行${k.success ? "完成" : "失败"}`,
+              k.output
+            );
           } else if (k.type === "assistant_text") {
             accumulatedText += k.content;
             updateAssistantContent();
+          } else if (k.type === "context_usage") {
+            // 实时上下文占用（后端每轮推送）
+            applyContextUsage(k.tokens || 0);
           } else if (k.type === "context_compressed") {
             const before = (k.before_tokens || 0) / 1000;
             const after = (k.after_tokens || 0) / 1000;
+            applyContextUsage(k.after_tokens || 0);
+            appendLog(
+              "context",
+              `上下文自动压缩：${before.toFixed(1)}k → ${after.toFixed(1)}k Tokens`,
+              "历史过长，已保留最近对话（对话未被清空）"
+            );
             addSystemMessage(`📦 上下文自动压缩：${before.toFixed(1)}k → ${after.toFixed(1)}k Tokens（历史过长，已保留最近对话）`);
           } else if (k.type === "done") {
             messages.value[msgIndex].content = accumulatedText || k.content;
             // thinking 模式要求 reasoning_content 随历史回传 → 存入消息
             if (k.reasoning_content) messages.value[msgIndex].reasoning_content = k.reasoning_content;
+            appendLog("answer", `AI 回复（${currentMode.value.toUpperCase()} 模式）`, accumulatedText || k.content);
             armWatchdog(20000);
           } else if (k.type === "error") {
             messages.value[msgIndex].content = `❌ 错误: ${k.message}`;
@@ -308,7 +406,16 @@ export const useAppStore = defineStore("app", () => {
       });
 
       const wd = workingDir || currentProject.value || undefined;
-      const result = await tauriAPI.sendAIMessageWithTools(currentMode.value, requestContent, history, contextPaths, wd, approvalMode.value);
+      const result = await tauriAPI.sendAIMessageWithTools(
+        currentMode.value,
+        requestContent,
+        history,
+        contextPaths,
+        wd,
+        approvalMode.value,
+        contextLimit.value,
+        compressionMode.value === "auto"
+      );
       invokeSettled = true;
       // 运行结束时清理遗留的待审批卡片（若审批门已超时关闭）
       pendingApproval.value = null;
@@ -316,14 +423,23 @@ export const useAppStore = defineStore("app", () => {
       messages.value[msgIndex].content = messages.value[msgIndex].content || result.content;
       runIdsByUserMsg.set(userMsg.id || "", result.run_id);
       lastContextTokens.value = result.context_tokens || 0;
+      applyContextUsage(result.context_tokens || 0);
+      appendLog(
+        "system",
+        `✅ Agent Loop 完成：${result.total_iterations} 步 / ${result.total_tool_calls} 个工具调用`,
+        `上下文占用 ${(contextRatio.value * 100).toFixed(1)}%（${((result.context_tokens || 0) / 1000).toFixed(1)}k / ${(contextLimit.value / 1000).toFixed(0)}k Tokens）`
+      );
       addSystemMessage(`✅ Agent Loop 完成: ${result.total_iterations} 步, ${result.total_tool_calls} 个工具调用`);
 
       unlisten();
+      // 每轮结束后：检查上下文占用（自动压缩 / 手动提示）
+      await maybeAutoCompressContext();
     } catch (e: any) {
       invokeSettled = true;
       clearWatchdog();
       messages.value[msgIndex].content = `❌ 错误: ${e}`;
       lastContextTokens.value = 0;
+      appendLog("system", `❌ Agent Loop 失败`, String(e));
     } finally {
       isLoading.value = false;
     }
@@ -395,6 +511,106 @@ export const useAppStore = defineStore("app", () => {
     messages.value.push({ id: newMsgId(), role: "system", content, type: "system" });
   }
 
+  // ─── 上下文占用比例：设置 / 更新 / 压缩 ───
+  function setContextLimit(limit: number) {
+    contextLimit.value = Math.max(1000, Math.floor(limit) || DEFAULT_CONTEXT_LIMIT);
+    localStorage.setItem("deep-ide-context-limit", String(contextLimit.value));
+  }
+  function setCompressionMode(mode: "auto" | "manual") {
+    compressionMode.value = mode;
+    localStorage.setItem("deep-ide-compression-mode", mode);
+    appendLog("context", `上下文压缩模式：${mode === "auto" ? "自动压缩" : "手动压缩"}`);
+  }
+  /** 后端返回的上下文用量 → 同步到界面 */
+  function applyContextUsage(tokens: number) {
+    if (typeof tokens === "number" && tokens >= 0) contextTokens.value = tokens;
+  }
+  /**
+   * 本地重算上下文占用（无需等待 Agent 运行）。
+   * 使用与后端一致的估算口径：消息内容字符数 / 2.5。
+   */
+  function recomputeContextUsage() {
+    const chars = messages.value.reduce((sum, m) => sum + (m.content ? m.content.length : 0), 0);
+    applyContextUsage(Math.ceil(chars / 2.5));
+  }
+  /** 手动压缩当前对话上下文（保留最近若干轮，不新建对话、不清空对话） */
+  async function compressContextManually(): Promise<{ before: number; after: number } | null> {
+    const history = messages.value
+      .filter(m => m.role !== "system")
+      .map(m => ({ role: m.role, content: m.content }));
+    if (history.length === 0) {
+      addSystemMessage("当前没有可压缩的上下文。");
+      return null;
+    }
+    // 少于 9 条时压缩保留下限（最近 4 轮 = 8 条）已覆盖全部内容，压缩无意义
+    if (history.length <= 8) {
+      appendLog("context", "上下文轮次过少，无需压缩", `当前仅 ${history.length} 条消息，压缩不会释放占用`);
+      return null;
+    }
+    try {
+      const r = await tauriAPI.compressContext(history, contextLimit.value, 4);
+      const before = r.before_tokens || 0;
+      const after = r.after_tokens || 0;
+      // 用压缩后的消息序列替换对话历史（真实降低后续每轮发送的上下文）
+      if (Array.isArray(r.compressed_messages) && r.compressed_messages.length > 0) {
+        messages.value = r.compressed_messages.map((m) => ({
+          id: newMsgId(),
+          role: m.role,
+          content: m.content,
+          type: m.type || m.role,
+        }));
+      }
+      contextTokens.value = after;
+      appendLog(
+        "context",
+        `压缩上下文：${(before / 1000).toFixed(1)}k → ${(after / 1000).toFixed(1)}k Tokens`,
+        `释放 ${(((before - after) / Math.max(before, 1)) * 100).toFixed(1)}% 上下文占用（对话未被清空，仅压缩较早轮次）`
+      );
+      addSystemMessage(
+        `📦 已压缩上下文：${(before / 1000).toFixed(1)}k → ${(after / 1000).toFixed(1)}k Tokens（对话未被清空）`
+      );
+      return { before, after };
+    } catch (e: any) {
+      addSystemMessage(`压缩上下文失败: ${e}`);
+      return null;
+    }
+  }
+  /**
+   * 每轮结束后检查上下文占用：
+   * - 自动模式：≥85% 自动压缩用户上下文（不清空对话）
+   * - 手动模式：≥85% 仅提示用户压缩上下文或清空当前对话
+   */
+  async function maybeAutoCompressContext() {
+    if (!contextWarning.value) return;
+    if (compressionMode.value === "auto") {
+      appendLog("context", `上下文占用 ${contextPercent.value}% ≥ 85%，触发自动压缩`, "自动压缩用户上下文，不清空对话");
+      await compressContextManually();
+    } else {
+      appendLog(
+        "context",
+        `⚠️ 上下文占用 ${contextPercent.value}% 已超过 85%`,
+        "手动压缩模式：建议压缩上下文或清空当前对话"
+      );
+      addSystemMessage(
+        `⚠️ 当前对话上下文已占用 ${contextPercent.value}%（≥85%）。建议压缩上下文或清空当前对话（可在 AI 配置中设置自动压缩）。`
+      );
+    }
+  }
+  /** 清空会话：清空右侧 AI 对话内容与上下文统计，但保留"日志"面板内容 */
+  function clearSession() {
+    messages.value = [];
+    totalTokens.value = 0;
+    streamingContent.value = "";
+    toolCalls.value = [];
+    agentIterations.value = 0;
+    agentMaxIterations.value = 0;
+    lastContextTokens.value = 0;
+    contextTokens.value = 0;
+    pendingApproval.value = null;
+    pastedImages.value = [];
+    runIdsByUserMsg.clear();
+  }
+
   // ─── 多模态视觉配置 ───
   async function configureVision(provider: string, key: string, baseUrl: string, model: string) {
     await tauriAPI.configureVision(provider, key, baseUrl, model);
@@ -402,28 +618,53 @@ export const useAppStore = defineStore("app", () => {
   }
 
   // ─── 粘贴图片：存临时文件 → 识别 → 与问题一起发送 ───
-  // preview 用于前端缩略图预览，path 用于发送时识别
-  const pastedImage = ref<{ path: string; preview: string } | null>(null);
-  async function setPastedImageFromBase64(data: string, ext: string) {
+  /** 兼容旧代码：单图访问器（返回第一张） */
+  const pastedImage = computed(() => pastedImages.value[0] ?? null);
+
+  /** 追加一张粘贴图片；超出上限返回 false */
+  async function addPastedImage(data: string, ext: string): Promise<boolean> {
+    if (pastedImages.value.length >= MAX_PASTE_IMAGES) {
+      appendLog("system", `粘贴图片被忽略`, `每次提问最多 ${MAX_PASTE_IMAGES} 张图片`);
+      addSystemMessage(`每次提问最多 ${MAX_PASTE_IMAGES} 张图片，请先发送或移除已添加的图片。`);
+      return false;
+    }
     try {
       const path = await tauriAPI.saveTempImage(data, ext);
-      pastedImage.value = { path, preview: data };
+      pastedImages.value.push({
+        path,
+        preview: data,
+        name: `图片 ${pastedImages.value.length + 1}`,
+      });
+      return true;
     } catch (e: any) {
       addSystemMessage(`粘贴图片失败: ${e}`);
+      return false;
     }
   }
-  function clearPastedImage() { pastedImage.value = null; }
+  /** 兼容旧调用 */
+  async function setPastedImageFromBase64(data: string, ext: string) {
+    await addPastedImage(data, ext);
+  }
+  function removePastedImage(index: number) {
+    pastedImages.value.splice(index, 1);
+  }
+  function clearPastedImage() { pastedImages.value = []; }
 
-  /// 发送一条带图片的消息：先识别图片，再把识别结果 + 用户问题一起发给模型
-  async function sendWithImage(question: string, imagePath: string) {
+  /// 发送一条带图片的消息：先识别每张图片，再把识别结果 + 用户问题一起发给模型
+  async function sendWithImages(question: string, imagePaths: string[]) {
     if (!apiKey.value) { addSystemMessage("请先配置 DeepSeek API Key"); return; }
     isLoading.value = true;
     try {
-      addSystemMessage("正在识别图片...");
-      const res = await tauriAPI.analyzeImage(imagePath);
-      const fullPrompt = `用户上传了一张图片（识别引擎：${res.provider}），以下是图片识别结果：\n\n${res.text}\n\n---\n用户问题：${question || "请描述并分析这张图片。"}`;
+      addSystemMessage(`正在识别 ${imagePaths.length} 张图片...`);
+      appendLog("system", `视觉引擎识图：${imagePaths.length} 张`, imagePaths.join("\n"));
+      const parts: string[] = [];
+      for (let i = 0; i < imagePaths.length; i++) {
+        const res = await tauriAPI.analyzeImage(imagePaths[i]);
+        parts.push(`【图片 ${i + 1}】（识别引擎：${res.provider}）\n${res.text}`);
+      }
+      const fullPrompt = `用户上传了 ${imagePaths.length} 张图片，以下是图片识别结果：\n\n${parts.join("\n\n")}\n\n---\n用户问题：${question || "请描述并分析这些图片。"}`;
       if (useTools.value) {
-        await sendMessageWithTools(fullPrompt, []);
+        await sendMessageWithTools(question || `请分析这 ${imagePaths.length} 张图片`, [], undefined, fullPrompt);
       } else {
         await sendMessageStream(fullPrompt, []);
       }
@@ -431,6 +672,11 @@ export const useAppStore = defineStore("app", () => {
       addSystemMessage(`识图失败: ${e}`);
       isLoading.value = false;
     }
+  }
+
+  /// 兼容旧调用：单图发送
+  async function sendWithImage(question: string, imagePath: string) {
+    await sendWithImages(question, [imagePath]);
   }
 
   function clearMessages() {
@@ -491,7 +737,16 @@ export const useAppStore = defineStore("app", () => {
     skinId, skinVariant, setSkin,
     checkSafety,
     configureVision,
-    pastedImage, setPastedImageFromBase64, clearPastedImage, sendWithImage,
+    pastedImage, pastedImages, setPastedImageFromBase64, addPastedImage, removePastedImage,
+    clearPastedImage, sendWithImage, sendWithImages,
+    // 日志（"日志"面板：模式切换 / 提问与回复 / 工具调用 / 操作过程）
+    sessionLogs, appendLog, clearLogs,
+    // 上下文占用比例 + 压缩（自动 / 手动）
+    contextLimit, contextTokens, contextRatio, contextPercent, contextWarning,
+    compressionMode, setContextLimit, setCompressionMode, applyContextUsage, recomputeContextUsage,
+    compressContextManually, maybeAutoCompressContext,
+    // 清空会话（保留日志）
+    clearSession,
   };
 });
 

@@ -6,9 +6,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::ai::{
     AgentEvent, AgentLoopInput, AgentLoopOutput, ApprovalGate, ApprovalMode,
     build_system_prompt, native_system_prompt,
-    ContextCompressor, CompressedMessage, ContextFile,
+    ContextCompressor, CompressorConfig, CompressedMessage, ContextFile,
     DeepSeekClient, Message, modes,
     UndoStore, apply_undo,
+    DEFAULT_CONTEXT_LIMIT,
 };
 
 /// 生成一次 Agent 运行的唯一 ID（时间戳 + 进程内自增 + 长度，避免依赖第三方随机库）
@@ -250,6 +251,8 @@ pub async fn send_ai_message_with_tools(
     context_paths: Vec<String>,
     working_dir: Option<String>,
     approval_mode: Option<String>,
+    context_limit: Option<usize>,
+    auto_compress: Option<bool>,
     ds_client: State<'_, DeepSeekClient>,
     undo_store: State<'_, UndoStore>,
     approval_gate: State<'_, Arc<ApprovalGate>>,
@@ -279,6 +282,9 @@ pub async fn send_ai_message_with_tools(
     gate_arc.set_app(app.clone());
 
     let run_id = new_run_id();
+    // 上下文窗口 + 压缩模式（自动 = 超 85% 自动压缩用户上下文；手动 = 仅提示）
+    let effective_limit = context_limit.unwrap_or(DEFAULT_CONTEXT_LIMIT).max(1000);
+    let effective_auto_compress = auto_compress.unwrap_or(false);
 
     let input = AgentLoopInput {
         mode: mode.clone(),
@@ -294,6 +300,8 @@ pub async fn send_ai_message_with_tools(
         extra_preamble: None,
         approval_mode: ApprovalMode::parse(&approval_mode.unwrap_or_else(|| "step".to_string())),
         approval_gate: gate_arc,
+        context_limit: effective_limit,
+        auto_compress: effective_auto_compress,
     };
 
     // 事件转发到 Tauri：每个 agent 事件触发 ai-agent-event
@@ -315,8 +323,110 @@ pub async fn send_ai_message_with_tools(
         "event_count": output.events.len(),
         "run_id": output.run_id,
         "context_tokens": output.context_tokens,
+        "context_limit": output.context_limit,
+        "context_ratio": output.context_ratio,
         "compressed": output.compressed,
     }))
+}
+
+/// ════════════════════════════════════════════════════════
+/// 上下文占用比例 + 压缩（自动 / 手动）
+/// ════════════════════════════════════════════════════════
+
+/// 实时估算一段对话的上下文占用。
+/// frontend 传入当前 System Prompt、对话消息与上下文文件路径，后端返回 tokens / limit / ratio。
+#[tauri::command]
+pub fn estimate_context_usage(
+    system_prompt: Option<String>,
+    messages: Vec<Message>,
+    context_paths: Option<Vec<String>>,
+    context_limit: Option<usize>,
+) -> serde_json::Value {
+    let limit = context_limit.unwrap_or(DEFAULT_CONTEXT_LIMIT).max(1000);
+
+    let mut tokens = ContextCompressor::estimate_tokens(system_prompt.as_deref().unwrap_or(""));
+    if let Some(paths) = &context_paths {
+        for p in paths {
+            let parsed = crate::ai::file_parser::parse_file(p);
+            tokens += ContextCompressor::estimate_tokens(&parsed.content);
+        }
+    }
+    tokens += messages
+        .iter()
+        .map(|m| ContextCompressor::estimate_tokens(&m.content))
+        .sum::<usize>();
+
+    let ratio = (tokens as f64 / limit as f64).min(1.0);
+    serde_json::json!({
+        "tokens": tokens,
+        "limit": limit,
+        "ratio": ratio,
+    })
+}
+
+/// 手动压缩上下文：返回压缩前后的 Token 数与压缩后的消息序列。
+/// 调用方可用 `compressed_messages` 直接替换当前对话历史（对话不被清空，只压缩较早轮次）。
+#[tauri::command]
+pub fn compress_context(
+    messages: Vec<Message>,
+    max_tokens: Option<usize>,
+    preserve_recent_turns: Option<usize>,
+) -> serde_json::Value {
+    let mut config = CompressorConfig::with_limit(max_tokens.unwrap_or(DEFAULT_CONTEXT_LIMIT), true);
+    if let Some(n) = preserve_recent_turns {
+        config.preserve_recent_turns = n.max(1);
+    }
+    let compressor = ContextCompressor::new(config);
+
+    let input: Vec<CompressedMessage> = messages
+        .iter()
+        .map(|m| CompressedMessage {
+            role: m.role.clone(),
+            content: m.content.clone(),
+            estimated_tokens: ContextCompressor::estimate_tokens(&m.content),
+        })
+        .collect();
+
+    let before_tokens = compressor.total_tokens(&input);
+    let compressed = compressor.compress(&input);
+    let after_tokens = compressor.total_tokens(&compressed);
+
+    let summary = compressed
+        .iter()
+        .find(|m| m.content.contains("Conversation Summary"))
+        .map(|m| m.content.clone())
+        .unwrap_or_default();
+
+    let compressed_messages: Vec<serde_json::Value> = compressed
+        .iter()
+        .map(|m| {
+            serde_json::json!({
+                "role": m.role,
+                "content": m.content,
+                "type": m.role,
+            })
+        })
+        .collect();
+
+    serde_json::json!({
+        "before_tokens": before_tokens,
+        "after_tokens": after_tokens,
+        "removed_messages": input.len().saturating_sub(compressed.len()),
+        "summary": summary,
+        "compressed_messages": compressed_messages,
+    })
+}
+
+/// 当前上下文压缩配置（默认窗口 / 阈值比例 / 保留轮数）
+#[tauri::command]
+pub fn get_context_config(context_limit: Option<usize>) -> serde_json::Value {
+    let config = CompressorConfig::with_limit(context_limit.unwrap_or(DEFAULT_CONTEXT_LIMIT), false);
+    serde_json::json!({
+        "max_tokens": config.max_tokens,
+        "warn_ratio": config.warn_ratio,
+        "compression_threshold": config.warn_ratio,
+        "preserve_recent_turns": config.preserve_recent_turns,
+    })
 }
 
 /// 查询某次 Agent 运行记录的"可撤销文件变更"数量（撤回对话框用）

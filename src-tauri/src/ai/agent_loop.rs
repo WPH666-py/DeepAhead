@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::ai::approval::{ApprovalGate, ApprovalMode};
-use crate::ai::context::{CompressedMessage, ContextCompressor};
+use crate::ai::context::{CompressedMessage, CompressorConfig, ContextCompressor};
 use crate::ai::deepseek::{DeepSeekClient, Message};
 use crate::ai::tools::{ToolRegistry, ToolCall, ToolResult, ToolSchema, ToolFunction, SubagentExecutor, detect_runtimes};
 use crate::ai::undo::UndoStore;
@@ -104,6 +104,8 @@ pub enum AgentEventKind {
     FileChanged { reason: String },
     /// 上下文自动压缩发生（tool 调用链上提示）
     ContextCompressed { before_tokens: usize, after_tokens: usize },
+    /// 实时上下文占用（每轮推送；tokens = 当前对话占用 Token 估算值）
+    ContextUsage { tokens: usize },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -148,6 +150,10 @@ pub struct AgentLoopInput {
     pub approval_mode: ApprovalMode,
     /// 审批门（跨阶段/子智能体共享；open 模式为无操作放行）
     pub approval_gate: Arc<ApprovalGate>,
+    /// 上下文窗口（Token）：用于计算占用比例与压缩触发线
+    pub context_limit: usize,
+    /// 上下文压缩模式：true = 自动（≥85% 自动压缩用户上下文，不清空对话）；false = 手动（仅提示）
+    pub auto_compress: bool,
 }
 
 pub struct AgentLoopOutput {
@@ -159,6 +165,10 @@ pub struct AgentLoopOutput {
     pub run_id: String,
     /// 估算的上下文 Token 数（发送给模型前）
     pub context_tokens: usize,
+    /// 上下文窗口（Token）
+    pub context_limit: usize,
+    /// 最终上下文占用比例（0.0 ~ 1.0）
+    pub context_ratio: f64,
     /// 是否发生了上下文自动压缩
     pub compressed: bool,
 }
@@ -213,30 +223,41 @@ where
         }
     }
 
-    // 2. 初始化消息历史（历史超长时先做上下文自动压缩，只压缩发送前的历史，
-    //    当前用户消息与工具结果配对必须原样保留）
+    // 2. 初始化消息历史
+    //    压缩策略（自动 / 手动）：
+    //    - 自动：占用 ≥85% 时压缩"用户上下文"（历史对话），保留最近若干轮，不清空对话
+    //    - 手动：只统计占用并上报，不自动压缩（前端提示用户手动压缩或清空对话）
+    //    工具结果与当前用户消息配对必须原样保留，因此压缩点在每轮请求之前。
     let mut compressed = false;
     let mut history: Vec<Message> = input.history.clone();
+    let mut compressor = ContextCompressor::new(CompressorConfig::with_limit(
+        input.context_limit,
+        input.auto_compress,
+    ));
+
+    // 上下文占用估算：System Prompt + 本次用户消息 + 历史对话 + 工具结果
+    let base_tokens = ContextCompressor::estimate_tokens(&system_prompt);
+    let mut last_reported_tokens = usize::MAX;
+
+    // 先做一次起始压缩（历史本身已超阈值时）
     {
-        let compressor = ContextCompressor::with_defaults();
-        let compressed_messages: Vec<CompressedMessage> = history.iter().map(|m| CompressedMessage {
-            role: m.role.clone(),
-            content: m.content.clone(),
-            estimated_tokens: ContextCompressor::estimate_tokens(&m.content),
-        }).collect();
-        if compressor.needs_compression(&compressed_messages) {
-            let before_tokens: usize = compressed_messages.iter().map(|m| m.estimated_tokens).sum();
-            let compressed_msgs = compressor.compress(&compressed_messages);
-            let after_tokens: usize = compressed_msgs.iter().map(|m| m.estimated_tokens).sum();
-            history = compressed_msgs.into_iter().map(|cm| Message {
-                role: cm.role.clone(),
-                content: cm.content.clone(),
-                tool_calls: None,
-                tool_call_id: None,
-                name: None,
-                reasoning_content: None,
-                r#type: cm.role.clone(),
-            }).collect();
+        let cm = messages_to_compressed(&history);
+        if compressor.needs_compression(&cm) {
+            let before_tokens = base_tokens + compressor.total_tokens(&cm);
+            let comp = compressor.compress(&cm);
+            let after_tokens = base_tokens + compressor.total_tokens(&comp);
+            history = comp
+                .into_iter()
+                .map(|c| Message {
+                    role: c.role.clone(),
+                    content: c.content.clone(),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                    reasoning_content: None,
+                    r#type: c.role.clone(),
+                })
+                .collect();
             compressed = true;
             let ev = AgentEvent::new(AgentEventKind::ContextCompressed { before_tokens, after_tokens });
             events.push(ev.clone());
@@ -244,10 +265,7 @@ where
         }
     }
 
-    // 估算发送给模型的上下文 Token 数（用于前端展示"上下文功能"）
-    let context_tokens: usize = ContextCompressor::estimate_tokens(&system_prompt)
-        + ContextCompressor::estimate_tokens(&input.user_message)
-        + history.iter().map(|m| ContextCompressor::estimate_tokens(&m.content)).sum::<usize>();
+    // 上下文占用在每轮循环前重新计算（见下方 ContextUsage 事件）
 
     let mut messages: Vec<Message> = Vec::new();
     messages.push(Message {
@@ -288,6 +306,47 @@ where
             &mut events,
             &mut on_event,
         );
+
+        // ─── 上下文占用实时上报 + 阈值处理（自动压缩 / 手动提示）───
+        // 后端只上报占用 Token；压缩模式与阈值提示由前端按 85% 规则决定并展示。
+        {
+            let usage = current_usage(base_tokens, &messages);
+            if usage != last_reported_tokens {
+                last_reported_tokens = usage;
+                let ev = AgentEvent::new(AgentEventKind::ContextUsage { tokens: usage });
+                events.push(ev.clone());
+                on_event(ev);
+            }
+        }
+        // 自动压缩模式：占用超阈值时压缩"用户上下文"（保留最近若干轮，不清空对话）
+        if input.auto_compress {
+            let cm = messages_to_compressed(&messages);
+            if compressor.needs_compression(&cm) {
+                let before_tokens = base_tokens + compressor.total_tokens(&cm);
+                let comp = compressor.compress(&cm);
+                let after_tokens = base_tokens + compressor.total_tokens(&comp);
+                messages = comp
+                    .into_iter()
+                    .map(|c| Message {
+                        role: c.role.clone(),
+                        content: c.content.clone(),
+                        tool_calls: None,
+                        tool_call_id: None,
+                        name: None,
+                        reasoning_content: None,
+                        r#type: c.role.clone(),
+                    })
+                    .collect();
+                compressed = true;
+                let ev = AgentEvent::new(AgentEventKind::ContextCompressed { before_tokens, after_tokens });
+                events.push(ev.clone());
+                on_event(ev);
+                let ev = AgentEvent::new(AgentEventKind::ContextUsage { tokens: after_tokens });
+                events.push(ev.clone());
+                on_event(ev);
+                last_reported_tokens = after_tokens;
+            }
+        }
 
         // Kimi 模式：每步注入"先思考"提醒
         if config.require_thinking_prefix && iter > 0 {
@@ -405,7 +464,9 @@ where
                 total_tool_calls,
                 events,
                 run_id: input.run_id.clone(),
-                context_tokens,
+                context_tokens: current_usage(base_tokens, &messages),
+                context_limit: compressor.config().max_tokens,
+                context_ratio: compressor.usage_ratio(&messages_to_compressed(&messages)),
                 compressed,
             });
         }
@@ -559,7 +620,9 @@ where
         total_tool_calls,
         events,
         run_id: input.run_id.clone(),
-        context_tokens,
+        context_tokens: current_usage(base_tokens, &messages),
+        context_limit: compressor.config().max_tokens,
+        context_ratio: compressor.usage_ratio(&messages_to_compressed(&messages)),
         compressed,
     })
 }
@@ -567,6 +630,25 @@ where
 // ════════════════════════════════════════════════════════
 // 辅助函数
 // ════════════════════════════════════════════════════════
+
+/// 通用消息 → 可压缩消息（带 Token 估算）
+fn messages_to_compressed(ms: &[Message]) -> Vec<CompressedMessage> {
+    ms.iter()
+        .map(|m| CompressedMessage {
+            role: m.role.clone(),
+            content: m.content.clone(),
+            estimated_tokens: ContextCompressor::estimate_tokens(&m.content),
+        })
+        .collect()
+}
+
+/// 当前上下文占用 = 基础（System Prompt）+ 全部对话消息
+fn current_usage(base: usize, ms: &[Message]) -> usize {
+    base + ms
+        .iter()
+        .map(|m| ContextCompressor::estimate_tokens(&m.content))
+        .sum::<usize>()
+}
 
 fn mode_loop_directives(mode: &str, cfg: &LoopConfig) -> String {
     let mut s = String::new();
@@ -845,6 +927,8 @@ fn make_subagent_executor(input: &AgentLoopInput) -> SubagentExecutor {
     let run_id = input.run_id.clone();
     let approval_mode = input.approval_mode;
     let approval_gate = input.approval_gate.clone();
+    let context_limit = input.context_limit;
+    let auto_compress = input.auto_compress;
     Arc::new(move |instruction: String| -> futures_util::future::BoxFuture<'static, Result<String, String>> {
         let deepseek = deepseek.clone();
         let system_prompt = system_prompt.clone();
@@ -871,6 +955,9 @@ fn make_subagent_executor(input: &AgentLoopInput) -> SubagentExecutor {
                 // 子智能体同样受执行许可门约束（step 模式下每个工具调用都需要批准）
                 approval_mode,
                 approval_gate,
+                // 子智能体沿用主循环的上下文窗口与压缩模式
+                context_limit,
+                auto_compress,
             };
             let output = run_agent_loop(sub_input, |_| {}).await;
             match output {

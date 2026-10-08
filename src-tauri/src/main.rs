@@ -42,6 +42,10 @@ fn main() {
             commands::get_vision_config,
             commands::analyze_image,
             commands::save_temp_image,
+            // 上下文占用比例 + 压缩（自动 / 手动）
+            commands::estimate_context_usage,
+            commands::compress_context,
+            commands::get_context_config,
             // 执行许可（需分步确认 / 全流程开放）
             commands::respond_tool_approval,
             // Agent + 安全

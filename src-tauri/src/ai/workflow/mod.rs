@@ -188,6 +188,12 @@ pub fn assemble_output<'a>(
         events,
         run_id: input.run_id.clone(),
         context_tokens,
+        context_limit: input.context_limit,
+        context_ratio: if input.context_limit > 0 {
+            (context_tokens as f64 / input.context_limit as f64).min(1.0)
+        } else {
+            0.0
+        },
         compressed: false,
     }
 }
@@ -209,6 +215,9 @@ pub fn clone_for_phase(input: &AgentLoopInput) -> AgentLoopInput {
         extra_preamble: None,
         approval_mode: input.approval_mode,
         approval_gate: input.approval_gate.clone(),
+        // 阶段沿用主运行的上下文窗口与压缩模式
+        context_limit: input.context_limit,
+        auto_compress: input.auto_compress,
     }
 }
 

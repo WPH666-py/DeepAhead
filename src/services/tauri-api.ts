@@ -17,8 +17,7 @@ export interface AgentLoopResult {
   run_id: string;
   context_tokens: number;
   compressed: boolean;
-}
-export interface ModeInfo { id: string; name: string; desc: string; provider: string; emulated_model: string; coding_style: string; review_rigor: string; architecture_first: boolean; best_for: string[]; system_prompt_preview: string; engine?: string; upstream?: string; license?: string; mechanism?: string; }
+}export interface ModeInfo { id: string; name: string; desc: string; provider: string; emulated_model: string; coding_style: string; review_rigor: string; architecture_first: boolean; best_for: string[]; system_prompt_preview: string; engine?: string; upstream?: string; license?: string; mechanism?: string; }
 export interface AgentDef { name: string; description: string; system_prompt: string; allowed_tools: string[]; }
 export interface FileEntry { name: string; path: string; is_dir: boolean; size: number; children?: FileEntry[]; }
 export interface DirListResult { entries: FileEntry[]; path: string; }
@@ -38,6 +37,16 @@ export interface SafetyResult { rule_id: string; message: string; action: "confi
 // ─── 多模态视觉（DeepSeek-OCR / ModLens） ───
 export interface VisionConfigInfo { provider: string; api_key: string; base_url: string; model: string; configured: boolean; }
 export interface VisionResult { text: string; provider: string; image_path: string; }
+
+// ─── 上下文占用 + 压缩 ───
+export interface ContextUsage { tokens: number; limit: number; ratio: number; }
+export interface CompressResult {
+  before_tokens: number;
+  after_tokens: number;
+  removed_messages: number;
+  summary: string;
+  compressed_messages: Message[];
+}
 
 export const tauriAPI = {
   // ─── 项目 ───
@@ -66,10 +75,25 @@ export const tauriAPI = {
   sendAIMessageStream: (mode: string, message: string, history: Message[], contextPaths: string[]) => invoke<{content:string;mode:string}>("send_ai_message_stream", { mode, message, history, contextPaths }),
 
   // ─── Agent Loop with Tools（Claude Code / Cursor 风格）───
-  sendAIMessageWithTools: (mode: string, message: string, history: Message[], contextPaths: string[], workingDir?: string, approvalMode: string = "step") =>
+  sendAIMessageWithTools: (
+    mode: string,
+    message: string,
+    history: Message[],
+    contextPaths: string[],
+    workingDir?: string,
+    approvalMode: string = "step",
+    contextLimit?: number,
+    autoCompress: boolean = false,
+  ) =>
     invoke<AgentLoopResult>(
       "send_ai_message_with_tools",
-      { mode, message, history, contextPaths, workingDir: workingDir || null, approvalMode }
+      {
+        mode, message, history, contextPaths,
+        workingDir: workingDir || null,
+        approvalMode,
+        contextLimit: contextLimit ?? null,
+        autoCompress,
+      }
     ),
   // 应答一次工具调用审批（需分步确认模式；approvalId 来自 tool_approval_required 事件）
   respondToolApproval: (approvalId: string, approved: boolean) => invoke<void>("respond_tool_approval", { approvalId, approved }),
@@ -114,6 +138,13 @@ export const tauriAPI = {
   runCommand: (path: string, command: string) => invoke<string>("run_command", { path, command }),
   runFile: (path: string, runtime?: string) => invoke<string>("run_file", { path, runtime: runtime || null }),
   detectRuntimes: () => invoke<{name:string;version:string|null;available:boolean;path:string|null}[]>("detect_runtimes_enhanced"),
+
+  // ─── 上下文占用比例 + 压缩 ───
+  estimateContextUsage: (systemPrompt: string, messages: Message[], contextPaths: string[] = []) =>
+    invoke<ContextUsage>("estimate_context_usage", { systemPrompt, messages, contextPaths }),
+  compressContext: (messages: { role: string; content: string }[], maxTokens: number, preserveRecentTurns = 4) =>
+    invoke<CompressResult>("compress_context", { messages, maxTokens, preserveRecentTurns }),
+  getContextConfig: () => invoke<{ max_tokens: number; compression_threshold: number; preserve_recent_turns: number }>("get_context_config"),
 
   // ─── 会话 ───
   saveSession: (id: string, name: string, mode: string, agent: string, messages: Message[], totalTokens: number) => invoke<string>("save_session", { id, name, mode, agent, messages, totalTokens }),

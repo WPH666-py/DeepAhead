@@ -250,6 +250,7 @@ body {
 .terminal-content .term-cmd::before { content: '> '; color: #4ec9b0; flex-shrink: 0; }
 .terminal-content .term-out { color: #d4d4d4; }
 .terminal-content .term-err { color: #f44747; }
+.terminal-content .term-info { color: #6a9955; font-style: italic; }
 .terminal-content .term-sep { color: #555; margin: 4px 0; }
 .code-editor .cm-editor {
     position: absolute !important;
@@ -297,18 +298,18 @@ body {
 .ai-tab.active { color: #333; border-bottom-color: #333; }
 .ai-panel-content { flex: 1; display: none; flex-direction: column; overflow: hidden; }
 .ai-panel-content.active { display: flex; }
-.ai-chat { flex: 1; padding: 0.8rem; overflow-y: auto; font-size: 0.84rem; }
+.ai-chat { flex: 1; min-height: 0; padding: 0.8rem; overflow-y: auto; font-size: 0.84rem; }
 .message { margin-bottom: 0.6rem; padding: 0.5rem 0.7rem; border-radius: 6px; font-size: 0.84rem; line-height: 1.55; word-break: break-word; }
 .user-message { background: #f0f0f0; color: #333; }
 .ai-message { background: #fff; border: 1px solid #eee; color: #333; }
-.ai-input-area { padding: 0.7rem; border-top: 1px solid #eee; flex-shrink: 0; }
+.ai-input-area { padding: 0.75rem 0.85rem 0.85rem; border-top: 1px solid #eee; flex-shrink: 0; }
 .ai-input-area textarea {
-    width: 100%; min-height: 80px; max-height: 300px; resize: none; border: 1px solid #e0e0e0;
-    border-radius: 6px; padding: 0.5rem; font-size: 0.84rem; outline: none;
-    font-family: inherit; line-height: 1.4; overflow-y: auto;
+    width: 100%; min-height: 120px; max-height: 420px; resize: none; border: 1px solid #e0e0e0;
+    border-radius: 6px; padding: 0.6rem 0.65rem; font-size: 0.85rem; outline: none;
+    font-family: inherit; line-height: 1.55; overflow-y: auto;
 }
 .ai-input-area textarea:focus { border-color: #aaa; }
-.ai-send-row { display: flex; align-items: center; gap: 0.4rem; margin-top: 0.5rem; flex-wrap: wrap; }
+.ai-send-row { display: flex; align-items: center; gap: 0.4rem; margin-top: 0.55rem; flex-wrap: wrap; }
 .ai-send-row select {
     flex: 1; min-width: 120px; padding: 0.4rem 0.35rem; border: 1px solid #e0e0e0;
     border-radius: 4px; font-size: 0.78rem; color: #555; outline: none;
@@ -362,9 +363,150 @@ body {
     padding: 0.6rem 0.8rem; cursor: default;
 }
 .agent-tools-dropdown .agent-progress-item:hover { background: transparent; }
-.agent-tools-dropdown .agent-tool-item {
-    font-family: 'Cascadia Code', 'Consolas', monospace;
-    font-size: 0.74rem; gap: 6px;
+
+/* ========== 日志面板（模式切换 / 提问与回复 / 工具调用 / 操作过程） ========== */
+.agent-logs-dropdown {
+    left: auto; right: 0; min-width: 560px; max-width: min(980px, 92vw);
+    max-height: 72vh; overflow-y: auto; padding: 0;
+}
+.agent-logs-head {
+    display: flex; align-items: center; justify-content: space-between; gap: 0.6rem;
+    padding: 0.5rem 0.8rem; border-bottom: 1px solid #eee;
+    font-size: 0.72rem; color: #888; position: sticky; top: 0; background: #fff; z-index: 2;
+}
+.agent-logs-clear {
+    flex-shrink: 0; border: 1px solid #e0e0e0; background: #fff; color: #888;
+    border-radius: 4px; font-size: 0.7rem; padding: 0.15rem 0.5rem; cursor: pointer;
+}
+.agent-logs-clear:hover { border-color: #e74c3c; color: #e74c3c; }
+.agent-logs-dropdown .agent-progress-item {
+    display: flex; flex-direction: column; gap: 6px;
+    padding: 0.5rem 0.8rem; cursor: default;
+}
+.agent-logs-dropdown .agent-progress-item:hover { background: transparent; }
+.agent-log-item {
+    border-bottom: 1px solid #f5f5f5; font-size: 0.74rem;
+    border-left: 3px solid transparent;
+}
+.agent-log-item:last-child { border-bottom: none; }
+.agent-log-item.log-mode { border-left-color: #8e44ad; }
+.agent-log-item.log-question { border-left-color: #1a73e8; }
+.agent-log-item.log-answer { border-left-color: #27ae60; }
+.agent-log-item.log-tool { border-left-color: #f39c12; }
+.agent-log-item.log-system { border-left-color: #95a5a6; }
+.agent-log-item.log-context { border-left-color: #16a085; }
+.agent-log-header {
+    display: flex; align-items: baseline; gap: 0.45rem;
+    padding: 0.3rem 0.7rem; cursor: pointer;
+}
+.agent-log-header:hover { background: #fafafa; }
+.agent-log-kind {
+    flex-shrink: 0; font-size: 0.66rem; border-radius: 3px; padding: 0 0.32rem;
+    background: #f0f0f0; color: #666; line-height: 1.5;
+}
+.agent-log-item.log-mode .agent-log-kind { background: #f3e8fd; color: #7d3c98; }
+.agent-log-item.log-question .agent-log-kind { background: #e8f0fe; color: #1a56b8; }
+.agent-log-item.log-answer .agent-log-kind { background: #e8f5e9; color: #1e7e34; }
+.agent-log-item.log-tool .agent-log-kind { background: #fff5e1; color: #a76b00; }
+.agent-log-item.log-context .agent-log-kind { background: #e0f2f1; color: #0e7a68; }
+.agent-log-time { flex-shrink: 0; color: #b0b0b0; font-size: 0.66rem; font-family: 'Cascadia Code','Consolas',monospace; }
+.agent-log-title {
+    flex: 1; min-width: 0; color: #333; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap;
+}
+.agent-log-expand { flex-shrink: 0; color: #999; font-size: 0.66rem; }
+.agent-log-detail {
+    margin: 0 0.7rem 0.5rem; padding: 0.45rem 0.6rem; background: #f7f7f8;
+    border: 1px solid #eee; border-radius: 4px; color: #555;
+    font-family: 'Cascadia Code','Consolas',monospace; font-size: 0.7rem;
+    white-space: pre-wrap; overflow-wrap: anywhere;
+    max-height: 320px; overflow-y: auto; line-height: 1.5;
+}
+
+/* ========== 上下文占用比例条 ========== */
+.ai-ctx-usage {
+    padding: 0.4rem 0.7rem 0; cursor: pointer;
+}
+.ai-ctx-usage-head {
+    display: flex; align-items: baseline; gap: 0.4rem;
+    font-size: 0.68rem; color: #888; margin-bottom: 0.22rem;
+}
+.ai-ctx-pct { font-weight: 700; color: #2c7a4b; font-size: 0.72rem; }
+.ai-ctx-usage.warn .ai-ctx-pct { color: #c0392b; }
+.ai-ctx-tokens { color: #aaa; font-family: 'Cascadia Code','Consolas',monospace; }
+.ai-ctx-mode {
+    margin-left: auto; border: 1px solid #e0e0e0; border-radius: 3px;
+    padding: 0 0.3rem; color: #888; font-size: 0.64rem;
+}
+.ai-ctx-bar {
+    width: 100%; height: 5px; background: #ececec; border-radius: 3px; overflow: hidden;
+}
+.ai-ctx-fill {
+    height: 100%; background: linear-gradient(90deg, #2c7a4b, #4caf7d);
+    border-radius: 3px; transition: width 0.3s ease, background 0.3s ease;
+}
+.ai-ctx-fill.warn { background: linear-gradient(90deg, #e67e22, #e74c3c); }
+.ai-input-notice {
+    margin: 0.35rem 0.7rem 0; padding: 0.35rem 0.5rem; border-radius: 5px;
+    font-size: 0.72rem; line-height: 1.5;
+}
+.ai-input-notice.warn { background: #fff6e5; border: 1px solid #f5d08a; color: #8a6100; }
+.ai-input-notice a { color: #1a73e8; text-decoration: underline; }
+
+/* ========== 输入区图片（缩小缩略图，随数量向上增加） ========== */
+.pasted-images-strip {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 0.35rem;
+    padding: 0.35rem 0; border-bottom: 1px dashed #eee; margin-bottom: 0.35rem;
+}
+.pasted-image-thumb { position: relative; display: inline-block; }
+.pasted-image-thumb img {
+    display: block; width: 54px; height: 54px; object-fit: cover;
+    border: 1px solid #c9d8f2; border-radius: 6px; background: #fff;
+}
+.pasted-image-thumb .chip-close {
+    position: absolute; top: -6px; right: -6px; width: 17px; height: 17px;
+    line-height: 15px; text-align: center; border-radius: 50%;
+    background: #e74c3c; color: #fff; border: 1px solid #fff;
+    font-size: 0.8rem; cursor: pointer; padding: 0;
+}
+.pasted-images-count { font-size: 0.68rem; color: #999; margin-left: 0.15rem; }
+
+/* ========== 输入区操作按钮 / 模式徽标 ========== */
+.ai-context-clear-btn {
+    padding: 0.2rem 0.5rem; border: 1px dashed #e0b4b4; border-radius: 4px;
+    background: transparent; color: #c0392b; font-size: 0.72rem; cursor: pointer;
+    white-space: nowrap; line-height: 1.4;
+}
+.ai-context-clear-btn:hover { border-color: #e74c3c; background: #fdf2f2; }
+.ai-mode-badge {
+    flex-shrink: 0; font-size: 0.68rem; border-radius: 10px; padding: 0.12rem 0.5rem;
+    background: #f0f0f0; color: #888; border: 1px solid #e4e4e4; white-space: nowrap;
+}
+.ai-mode-badge.agent { background: #e8f5e9; color: #1e7e34; border-color: #bfe3c6; }
+
+/* ========== AI 配置：Agent 徽标 / 视觉引擎与上下文提示 ========== */
+.config-agent-badge {
+    font-size: 0.72rem; line-height: 1.5; color: #1e7e34;
+    background: #e8f5e9; border: 1px solid #bfe3c6; border-radius: 5px;
+    padding: 0.35rem 0.5rem;
+}
+.config-vision-notice {
+    font-size: 0.72rem; line-height: 1.5; color: #8a6100;
+    background: #fff6e5; border: 1px solid #f5d08a; border-radius: 5px;
+    padding: 0.35rem 0.5rem;
+}
+.ctx-config-box {
+    border: 1px solid #eee; border-radius: 6px; padding: 0.6rem 0.7rem;
+    margin-top: 0.4rem; background: #fcfcfc;
+}
+.ctx-config-head {
+    display: flex; align-items: baseline; gap: 0.5rem; margin-bottom: 0.35rem;
+}
+.ctx-config-pct { font-size: 1.05rem; font-weight: 700; color: #2c7a4b; }
+.ctx-config-pct.warn { color: #c0392b; }
+.ctx-config-tokens { font-size: 0.72rem; color: #999; }
+.ctx-config-hint {
+    font-size: 0.7rem; color: #999; line-height: 1.5; margin: 0.1rem 0 0.6rem;
 }
 .agent-tool-header {
     display: flex; align-items: center; gap: 6px; cursor: pointer;

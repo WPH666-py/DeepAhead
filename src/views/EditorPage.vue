@@ -39,42 +39,42 @@
           <option value="quark">夸克</option>
         </select>
         <button class="menu-button" style="color:#27ae60;font-weight:600" @click="runProject">运行</button>
-        <!-- 工具菜单：仅显示工具调用进度与详情 -->
+        <!-- 日志菜单：模式切换 / 每轮提问与回复 / 工具调用结果 / 操作过程 -->
         <div style="position:relative">
           <button
             class="menu-button"
-            :class="{ active: openDropdown === 'agentTools' }"
-            @click="toggleDropdown('agentTools')"
+            :class="{ active: openDropdown === 'agentLogs' }"
+            @click="toggleDropdown('agentLogs')"
           >
-            🛠 工具 <span v-if="store.toolCalls.length > 0">({{ store.toolCalls.length }})</span> &#9662;
+            📋 日志 <span v-if="store.sessionLogs.length > 0">({{ store.sessionLogs.length }})</span> &#9662;
           </button>
-          <div class="dropdown-menu agent-tools-dropdown" :class="{ show: openDropdown === 'agentTools' }">
-            <!-- 工具调用进度与详情 -->
-            <div class="dropdown-item agent-progress-item" v-if="store.isLoading && store.useTools && store.agentMaxIterations > 0">
-              <div class="agent-progress-bar"><div class="agent-progress-fill" :style="{ width: (store.agentIterations / store.agentMaxIterations * 100) + '%' }"></div></div>
-              <span class="agent-progress-text">第 {{ store.agentIterations }}/{{ store.agentMaxIterations }} 步 · 已调 {{ store.toolCalls.length }} 个工具</span>
+          <div class="dropdown-menu agent-logs-dropdown" :class="{ show: openDropdown === 'agentLogs' }">
+            <div class="agent-logs-head">
+              <span>运行日志（模式切换 · 提问与回复 · 工具调用 · 操作过程）</span>
+              <button class="agent-logs-clear" @click.stop="clearLogs">清空日志</button>
             </div>
-            <div class="dropdown-divider" v-if="store.isLoading && store.useTools && store.agentMaxIterations > 0 && store.toolCalls.length > 0"></div>
-            <div v-for="tc in store.toolCalls" :key="tc.id" class="agent-tool-item" :class="tc.status">
-              <div class="agent-tool-header" @click="toggleToolCall(tc.id)">
-                <span class="tool-icon">{{ tc.status === 'running' ? '⏳' : tc.success ? '✓' : '✗' }}</span>
-                <span class="tool-name">{{ tc.name }}</span>
-                <span class="tool-args" v-if="!expandedToolCalls[tc.id]">{{ formatArgs(tc.arguments).slice(0, 40) }}</span>
-                <span class="tool-expand">{{ expandedToolCalls[tc.id] ? '▾' : '▸' }}</span>
-              </div>
-              <div v-if="expandedToolCalls[tc.id]" class="agent-tool-detail">
-                <div v-if="tc.status === 'running'" class="tool-detail-line" style="color:#999">⏳ 执行中…</div>
-                <div v-else>
-                  <div class="tool-detail-label">参数：</div>
-                  <pre class="tool-detail-pre">{{ formatArgs(tc.arguments) }}</pre>
-                  <div class="tool-detail-label" :style="{ color: tc.success ? '#27ae60' : '#e74c3c' }">
-                    {{ tc.success ? '✓ 结果：' : '✗ 错误：' }}
-                  </div>
-                  <pre class="tool-detail-pre" :class="tc.success ? 'tool-detail-pre-ok' : 'tool-detail-pre-err'">{{ tc.output || '(无输出)' }}</pre>
-                </div>
-              </div>
+            <!-- Agent 运行进度 -->
+            <div class="dropdown-item agent-progress-item" v-if="store.isLoading && store.useTools">
+              <div class="agent-progress-bar"><div class="agent-progress-fill" :style="{ width: agentProgressPct + '%' }"></div></div>
+              <span class="agent-progress-text">第 {{ store.agentIterations }}{{ store.agentMaxIterations > 0 ? '/' + store.agentMaxIterations : '' }} 步 · 已调 {{ store.toolCalls.length }} 个工具</span>
             </div>
-            <div v-if="store.toolCalls.length === 0" class="dropdown-item" style="color:#999">暂无工具调用</div>
+            <div class="dropdown-divider" v-if="store.isLoading && store.useTools && store.sessionLogs.length > 0"></div>
+            <!-- 日志条目 -->
+            <div
+              v-for="log in logsNewestFirst"
+              :key="log.id"
+              class="agent-log-item"
+              :class="'log-' + log.kind"
+            >
+              <div class="agent-log-header" @click="toggleLogEntry(log.id)">
+                <span class="agent-log-kind">{{ logKindLabel(log.kind) }}</span>
+                <span class="agent-log-time">{{ formatLogTime(log.ts) }}</span>
+                <span class="agent-log-title">{{ log.title }}</span>
+                <span class="agent-log-expand" v-if="log.detail">{{ expandedLogs[log.id] ? '▾' : '▸' }}</span>
+              </div>
+              <pre v-if="log.detail && expandedLogs[log.id]" class="agent-log-detail">{{ log.detail }}</pre>
+            </div>
+            <div v-if="store.sessionLogs.length === 0" class="dropdown-item" style="color:#999">暂无日志</div>
           </div>
         </div>
         <!-- AI 配置：打开配置弹窗 -->
@@ -181,39 +181,63 @@
             </div>
             <div v-if="store.isLoading" class="message ai-message"><div class="msg-role">AI</div><div class="msg-content">{{ store.streamingContent || '思考中...' }}</div></div>
           </div>
+          <!-- 上下文占用比例（实时显示当前对话上下文占用） -->
+          <div class="ai-ctx-usage" :class="{ warn: store.contextWarning }" @click="openAIConfig" title="点击打开 AI 配置：上下文窗口 / 压缩模式">
+            <div class="ai-ctx-usage-head">
+              <span>上下文占用</span>
+              <span class="ai-ctx-pct">{{ store.contextPercent }}%</span>
+              <span class="ai-ctx-tokens">~{{ (store.contextTokens / 1000).toFixed(1) }}k / {{ (store.contextLimit / 1000).toFixed(0) }}k Tokens</span>
+              <span class="ai-ctx-mode">{{ store.compressionMode === 'auto' ? '自动压缩' : '手动压缩' }}</span>
+            </div>
+            <div class="ai-ctx-bar">
+              <div class="ai-ctx-fill" :class="{ warn: store.contextWarning }" :style="{ width: Math.min(store.contextPercent, 100) + '%' }"></div>
+            </div>
+          </div>
+          <!-- 提示条：手动压缩模式超过 85% / 视觉引擎未配置 -->
+          <div v-if="store.contextWarning && store.compressionMode === 'manual'" class="ai-input-notice warn">
+            ⚠️ 上下文已占用 {{ store.contextPercent }}%（≥85%）：建议
+            <a href="#" @click.prevent="doManualCompress">压缩上下文</a>
+            或
+            <a href="#" @click.prevent="doClearSession">清空当前对话</a>
+          </div>
           <div class="ai-input-area">
+            <!-- 上下文文件 + 操作按钮：添加文件 / 清空会话 -->
             <div class="ai-context-bar">
               <span v-for="(ctx, idx) in aiContextFiles" :key="idx" class="ai-context-chip">{{ ctx.name }}<span class="chip-remove" @click="removeContextFile(idx)">×</span></span>
               <button class="ai-context-add-btn" @click="showFilePicker = true">+ 添加文件</button>
-              <span v-if="store.lastContextTokens" class="ai-context-stats" title="最近一次 AI 运行发送给模型的上下文（估算）">
-                上下文 ~{{ (store.lastContextTokens / 1000).toFixed(1) }}k Tokens
-              </span>
+              <button class="ai-context-clear-btn" @click="doClearSession" title="清空右侧 AI 对话内容（日志保留）">🗑 清空会话</button>
+            </div>
+            <!-- 已粘贴/添加的图片：缩小缩略图，随数量向上增加 -->
+            <div v-if="store.pastedImages.length" class="pasted-images-strip">
+              <div v-for="(img, idx) in store.pastedImages" :key="img.path" class="pasted-image-thumb">
+                <img :src="img.preview" :alt="img.name" />
+                <button class="chip-close" @click="store.removePastedImage(idx)" title="移除">&times;</button>
+              </div>
+              <span class="pasted-images-count">{{ store.pastedImages.length }}/{{ MAX_PASTE_IMAGES }}</span>
             </div>
             <textarea
               ref="aiInputRef"
               v-model="chatInput"
-              placeholder="输入您的问题...右键可添加文件到上下文"
-              rows="3"
+              :placeholder="inputPlaceholder"
+              rows="5"
               @input="autoResizeAIInput"
               @contextmenu="onAIInputContextMenu"
               @keyup.enter.exact="handleSend"
               @paste="onPasteImage"
               :disabled="store.isLoading"
             ></textarea>
-            <!-- 已粘贴图片：输入框内缩略图预览 -->
-            <div v-if="multimodalEnabled && store.pastedImage" class="pasted-image-inline">
-              <img :src="store.pastedImage.preview" alt="粘贴图片预览" />
-              <button class="chip-close" @click="store.clearPastedImage()" title="移除">&times;</button>
-            </div>
             <div class="ai-send-row">
               <select v-model="store.currentMode" @change="store.switchMode(store.currentMode)">
-                <option value="">选择模型...</option>
+                <option value="">选择模式...</option>
                 <option value="dsh">DSH (Harness)</option>
                 <option value="dsk">DSK (Kimi K3)</option>
                 <option value="dsa">DSA (GPT-6 Astra)</option>
                 <option value="dsf">DSF (Fable 5.1)</option>
               </select>
-              <button class="ai-send-btn" :disabled="store.isLoading || (!chatInput.trim() && !(multimodalEnabled && store.pastedImage))" @click="handleSend">发送</button>
+              <span class="ai-mode-badge" :class="{ agent: store.useTools }">
+                {{ store.useTools ? 'Agent 模式' : '对话模式' }}
+              </span>
+              <button class="ai-send-btn" :disabled="store.isLoading || (!chatInput.trim() && store.pastedImages.length === 0)" @click="handleSend">发送</button>
             </div>
           </div>
           <!-- 执行许可审批卡片（需分步确认模式：对标 Harness 审批门） -->
@@ -504,7 +528,7 @@
                 <b style="color:#333">DSF</b> — Claude Fable 5.1 原装工作流引擎（fable-orchestrator + fablewright, MIT）：CALL SHEET 路由 → 五段式委派 → 亲验 diff → 只读裁决。适合高波动、批量改造。
               </div>
               <div style="font-size:0.78rem;color:#999">
-                DSH 为原生 Harness 工作流；DSK / DSA / DSF 由 Rust 移植的厂商原装工作流引擎驱动（原版源码见仓库 vendor/），与 DeepSeek V4 运行时强强结合（无 Persona 模拟层）。全部模式只消耗 DeepSeek Token；开启「工具」后还可选择执行许可：需分步确认 / 全流程开放。
+                DSH 为原生 Harness 工作流；DSK / DSA / DSF 由 Rust 移植的厂商原装工作流引擎驱动（原版源码见仓库 vendor/），与 DeepSeek V4 运行时强强结合（无 Persona 模拟层）。全部模式只消耗 DeepSeek Token；勾选「工具」即默认 Agent 模式，还可选择执行许可：需分步确认 / 全流程开放。日志面板可查看模式切换、每轮提问与回复、全部工具调用结果与操作过程。
               </div>
             </div>
           </div>
@@ -546,14 +570,17 @@
           <p style="font-size:0.78rem;color:#888;margin-bottom:0.8rem">
             DeepAhead 只有 DeepSeek V4 一个运行时模型。DSH 为原生 Harness 工作流，DSK / DSA / DSF 由厂商原装工作流引擎（kimi-code / astra-advisor / fable-orchestrator+fablewright 移植）驱动，均走 DeepSeek Token。
           </p>
-          <!-- 能力开关：工具 / 多模态 / max -->
+          <!-- 能力开关：工具（Agent 模式） / 视觉引擎 / max -->
           <div class="config-field" style="display:flex;flex-direction:column;gap:0.55rem">
             <label style="display:flex;align-items:center;gap:0.5rem;font-weight:500;color:#333;width:100%;justify-content:flex-start;cursor:pointer">
               <input type="checkbox" :checked="store.useTools" @change="toggleTools" style="width:1rem;height:1rem;flex:none;cursor:pointer" />
               <span>🛠 工具</span>
-              <span style="margin-left:auto;font-size:0.72rem;color:#999">9 工具 Agent Loop</span>
+              <span style="margin-left:auto;font-size:0.72rem;color:#999">勾选即默认 Agent 模式 · 9 工具 Agent Loop</span>
             </label>
-            <!-- 开启工具后新增执行许可模式（对标 Harness 审批） -->
+            <!-- 勾选工具 = Agent 模式（默认），并显示执行许可（对标 Harness 审批） -->
+            <div v-if="store.useTools" class="config-agent-badge">
+              🤖 已启用 <b>Agent 模式</b>（勾选「工具」即默认走 Agent 循环：自主调用 9 个工具直到得出结论）
+            </div>
             <div v-if="store.useTools" style="display:flex;align-items:center;gap:0.5rem;width:100%;justify-content:flex-start">
               <span style="font-weight:500;color:#333;flex:none;font-size:0.85rem">🔐 执行许可</span>
               <select v-model="store.approvalMode" @change="store.setApprovalMode(store.approvalMode)" style="flex:1;padding:0.35rem 0.45rem;border:1px solid #ccc;border-radius:5px;font-size:0.8rem">
@@ -563,9 +590,14 @@
             </div>
             <label style="display:flex;align-items:center;gap:0.5rem;font-weight:500;color:#333;width:100%;justify-content:flex-start;cursor:pointer">
               <input type="checkbox" :checked="multimodalEnabled" @change="toggleMultimodal" style="width:1rem;height:1rem;flex:none;cursor:pointer" />
-              <span>🖼 多模态</span>
+              <span>🖼 视觉引擎</span>
               <span style="margin-left:auto;font-size:0.72rem;color:#999">识图（OCR/视觉）</span>
             </label>
+            <!-- 当前模型本身不具备多模态能力时的提示 -->
+            <div v-if="!modelHasNativeVision" class="config-vision-notice">
+              ⚠️ 当前连接的模型 <b>{{ modelInput || 'deepseek-chat' }}</b> 本身不具备多模态（识图）能力，
+              需要<b>搭配视觉引擎</b>使用：勾选「视觉引擎」并填写下方视觉模型配置，图片会先经视觉引擎转译为结构化文本再交给主模型。
+            </div>
             <label style="display:flex;align-items:center;gap:0.5rem;font-weight:500;color:#333;width:100%;justify-content:flex-start;cursor:pointer">
               <input type="checkbox" :checked="maxMode" @change="toggleMaxMode" style="width:1rem;height:1rem;flex:none;cursor:pointer" />
               <span>max</span>
@@ -576,10 +608,44 @@
           <div class="config-field"><label>Base URL</label><input v-model="baseUrlInput" placeholder="https://api.deepseek.com"></div>
           <div class="config-field"><label>Model</label><input v-model="modelInput" placeholder="deepseek-chat"></div>
 
-          <!-- 多模态开启时：显示视觉识别设置 -->
+          <!-- ─── 上下文占用比例 + 压缩上下文 ─── -->
+          <div style="border-top:1px solid #eee;margin:0.9rem 0 0.6rem"></div>
+          <label style="font-weight:500;color:#333">📊 上下文占用</label>
+          <div class="ctx-config-box">
+            <div class="ctx-config-head">
+              <span class="ctx-config-pct" :class="{ warn: store.contextWarning }">{{ store.contextPercent }}%</span>
+              <span class="ctx-config-tokens">
+                当前对话 ~{{ (store.contextTokens / 1000).toFixed(1) }}k / 窗口 {{ (store.contextLimit / 1000).toFixed(0) }}k Tokens
+              </span>
+            </div>
+            <div class="ai-ctx-bar">
+              <div class="ai-ctx-fill" :class="{ warn: store.contextWarning }" :style="{ width: Math.min(store.contextPercent, 100) + '%' }"></div>
+            </div>
+            <div class="config-field" style="margin-top:0.55rem">
+              <label>上下文窗口（Tokens）</label>
+              <input type="number" min="1000" step="1000" v-model.number="contextLimitInput" @change="applyContextLimit" placeholder="128000">
+            </div>
+            <div class="config-field">
+              <label>压缩模式</label>
+              <select :value="store.compressionMode" @change="onCompressionModeChange" style="width:100%;padding:0.45rem 0.5rem;border:1px solid #ccc;border-radius:5px">
+                <option value="manual">手动压缩（超过 85% 提示建议压缩上下文或清空当前对话）</option>
+                <option value="auto">自动压缩（超过 85% 自动压缩用户上下文，不清空对话）</option>
+              </select>
+            </div>
+            <div class="ctx-config-hint">
+              {{ store.compressionMode === 'auto'
+                ? '自动模式：占用 ≥85% 时自动压缩较早的对话轮次，当前对话与最近轮次保留，不会被清空。'
+                : '手动模式：占用 ≥85% 时只提示，不自动改动上下文；你可随时点击下方按钮手动压缩。' }}
+            </div>
+            <button class="btn btn-secondary" style="width:100%;font-size:0.82rem" :disabled="store.isLoading" @click="doManualCompress">
+              🗜 立即压缩上下文
+            </button>
+          </div>
+
+          <!-- 视觉引擎开启时：显示视觉识别设置 -->
           <template v-if="multimodalEnabled">
             <div style="border-top:1px solid #eee;margin:0.9rem 0 0.6rem"></div>
-            <label style="font-weight:500;color:#333">视觉识别（DeepSeek-OCR / ModLens）</label>
+            <label style="font-weight:500;color:#333">视觉引擎（DeepSeek-OCR / ModLens）</label>
             <div class="config-field">
               <label>引擎</label>
               <select v-model="visionProvider" style="width:100%;padding:0.45rem 0.5rem;border:1px solid #ccc;border-radius:5px">
@@ -593,7 +659,7 @@
           </template>
           <!-- 纯文本模式提示 -->
           <div v-else style="border-top:1px dashed #eee;margin:0.9rem 0 0.6rem;padding-top:0.4rem;font-size:0.72rem;color:#999">
-            当前为纯文本模式，识图已禁用；开启「多模态」可解锁视觉识别配置。
+            当前为纯文本模式，识图已禁用；开启「视觉引擎」可解锁视觉识别配置。
           </div>
 
           <div class="form-actions">
@@ -609,7 +675,7 @@
 
 <script setup lang="ts">
 import { ref, onMounted, nextTick, watch, computed } from "vue";
-import { useAppStore } from "../stores/app";
+import { useAppStore, MAX_PASTE_IMAGES, type LogKind } from "../stores/app";
 import { tauriAPI } from "../services/tauri-api";
 import FileTreeNode from "../components/layout/FileTreeNode.vue";
 import { createEditor, destroyEditor, getEditorContent, setEditorContent, setEditorLanguage, setEditorTheme } from "../utils/codemirror";
@@ -720,6 +786,33 @@ function toggleToolCall(id: string) {
   expandedToolCalls.value = { ...expandedToolCalls.value };
 }
 
+// ─── 日志面板（模式切换 / 提问与回复 / 工具调用结果 / 操作过程）───
+const expandedLogs = ref<Record<string, boolean>>({});
+function toggleLogEntry(id: string) {
+  expandedLogs.value[id] = !expandedLogs.value[id];
+  expandedLogs.value = { ...expandedLogs.value };
+}
+/** 日志倒序（最新在最上） */
+const logsNewestFirst = computed(() => [...store.sessionLogs].reverse());
+function logKindLabel(kind: LogKind): string {
+  return { mode: "模式", question: "提问", answer: "回复", tool: "工具", system: "系统", context: "上下文" }[kind] || kind;
+}
+function formatLogTime(ts: number): string {
+  const d = new Date(ts);
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+function clearLogs() {
+  store.clearLogs();
+  expandedLogs.value = {};
+}
+/** Agent 进度百分比（不限步数时无固定上限，进度条保持进行态） */
+const agentProgressPct = computed(() => {
+  const max = store.agentMaxIterations;
+  if (!max || max <= 0) return 0;
+  return Math.min((store.agentIterations / max) * 100, 100);
+});
+
 /**
  * 格式化工具参数：
  * - 如果是 JSON 字符串，先解析再用 JSON.stringify(..., null, 2) 美化，避免双重转义
@@ -765,10 +858,36 @@ const visionKeyInput = ref("");
 const visionBaseUrl = ref("https://api.openai.com/v1");
 const visionModel = ref("gpt-4o-mini");
 
-// 多模态（识图）开关：控制配置弹窗中视觉识别设置的可见性
+// 视觉引擎（识图）开关：控制配置弹窗中视觉识别设置的可见性
 const multimodalEnabled = ref(false);
 // 最大能力模式：开启 9 工具 Agent Loop（本地 ref，切换时同步到 store.useTools）
 const maxMode = ref(true);
+// 上下文窗口输入（AI 配置面板）
+const contextLimitInput = ref(store.contextLimit);
+
+/**
+ * 当前连接的模型本身是否具备多模态（识图）能力。
+ * DeepSeek V4 运行时为纯文本模型；若用户把 Model 改成已知的多模态模型
+ * （gpt-4o / glm-4v / qwen-vl / claude-3 / gemini 等），则可直接粘贴图片。
+ */
+const NATIVE_VISION_HINTS = [
+  "gpt-4o", "gpt-4.1", "gpt-4-turbo", "gpt-4-vision", "o1", "o3", "o4",
+  "glm-4v", "qwen-vl", "qwen2-vl", "qwen2.5-vl", "internvl", "llava",
+  "claude-3", "claude-4", "claude-sonnet", "claude-opus", "claude-haiku",
+  "gemini", "deepseek-vl", "step-1v", "yi-vision", "minicpm-v", "moonshot-v1-vision",
+];
+const modelHasNativeVision = computed(() => {
+  const m = (modelInput.value || store.model || "").toLowerCase();
+  return NATIVE_VISION_HINTS.some(h => m.includes(h));
+});
+/** 是否允许直接粘贴图片：模型原生多模态 或 已开启视觉引擎 */
+const canPasteImage = computed(() => modelHasNativeVision.value || multimodalEnabled.value);
+/** 输入框占位提示：纯文本模型未配置视觉引擎时明确提示 */
+const inputPlaceholder = computed(() =>
+  canPasteImage.value
+    ? "输入您的问题...可粘贴图片、右键添加文件到上下文"
+    : "这是纯文本模型，请配置视觉引擎后再粘贴图片；输入您的问题..."
+);
 
 // Tab 管理
 interface TabInfo { path: string; name: string; dirty: boolean; content?: string; kind?: "code" | "md" | "table"; previewHtml?: string; }
@@ -903,6 +1022,8 @@ onMounted(async () => {
     } catch (_) {}
   }
   loadInstalledExtensions();
+  // 初始化上下文占用显示（无需等待首次 Agent 运行）
+  store.recomputeContextUsage();
 });
 
 // ─── 基础导航 ───
@@ -1149,7 +1270,16 @@ function openHtmlInBrowser(path: string) {
 }
 
 // ─── 终端 ───
-function openLocalTerminal() { closeDropdowns(); showTerminal.value = true; nextTick(focusTerminalInput); tauriAPI.openTerminal(store.currentProject || "."); }
+/**
+ * 「本地终端」只切换内置 Terminal 面板，不再拉起系统 CMD / Windows Terminal。
+ * 命令在内置面板中执行（结果直接留在面板里，可导出/复制），避免弹出外部黑框。
+ */
+function openLocalTerminal() {
+  closeDropdowns();
+  showTerminal.value = true;
+  terminalLines.value.push({ type: "term-info", text: `内置终端 · 工作目录 ${store.currentProject || "."}` });
+  nextTick(() => { scrollTerminal(); focusTerminalInput(); });
+}
 function closeTerminalPanel() { showTerminal.value = false; }
 function focusTerminalInput() { nextTick(() => termInputRef.value?.focus()); }
 async function execTermCmd() {
@@ -1402,14 +1532,15 @@ async function gitPush() {
 function roleLabel(r: string) { return { user: "你", assistant: "AI", system: "系统" }[r] || r; }
 function msgClass(r: string) { return { "user-message": r === "user", "ai-message": r === "assistant", "system-message": r === "system" }; }
 async function handleSend() {
-  // 多模态开启且有粘贴图片：识别图片 + 问题一起发送（无文本也可用默认问题）
-  if (multimodalEnabled.value && store.pastedImage) {
+  // 有粘贴图片：先经视觉引擎识别，再连问题一起发送（无文本也可用默认问题）
+  if (store.pastedImages.length > 0) {
+    if (!canPasteImage.value) { alert("这是纯文本模型，请配置视觉引擎后再使用图片。"); return; }
     const q = chatInput.value.trim();
     chatInput.value = "";
     if (aiInputRef.value) aiInputRef.value.style.height = "auto";
-    const path = store.pastedImage.path;
+    const paths = store.pastedImages.map(i => i.path);
     store.clearPastedImage();
-    await store.sendWithImage(q, path);
+    await store.sendWithImages(q, paths);
     nextTick(() => { if (aiChatRef.value) aiChatRef.value.scrollTop = aiChatRef.value.scrollHeight; });
     return;
   }
@@ -1424,6 +1555,36 @@ async function handleSend() {
     await store.sendMessageStream(t, ctxPaths);
   }
   nextTick(() => { if (aiChatRef.value) aiChatRef.value.scrollTop = aiChatRef.value.scrollHeight; });
+}
+
+// ─── 清空会话 / 上下文压缩 ───
+/** 清空会话：清空右侧 AI 对话内容与上下文统计，日志内容保留 */
+async function doClearSession() {
+  if (store.isLoading) { alert("AI 正在运行中，请等待完成后再清空会话。"); return; }
+  if (store.messages.length === 0) return;
+  const ok = await showInlineConfirm("清空会话", "将清空右侧 AI 对话内容与上下文占用统计（日志面板内容保留）。确定继续吗？");
+  if (!ok) return;
+  store.clearSession();
+  chatInput.value = "";
+  aiContextFiles.value = [];
+  store.appendLog("system", "已清空会话（AI 对话内容已清空，日志保留）");
+}
+/** 手动压缩上下文（不新建对话，只压缩较早轮次） */
+async function doManualCompress() {
+  if (store.isLoading) { alert("AI 正在运行中，请等待完成后再压缩上下文。"); return; }
+  await store.compressContextManually();
+}
+/** 切换压缩模式（自动 / 手动） */
+function onCompressionModeChange(e: Event) {
+  const mode = (e.target as HTMLSelectElement).value as "auto" | "manual";
+  store.setCompressionMode(mode);
+  store.addSystemMessage(mode === "auto" ? "已开启自动压缩上下文（≥85% 自动压缩，不清空对话）" : "已切换为手动压缩上下文（≥85% 仅提示）");
+}
+/** 应用上下文窗口大小 */
+function applyContextLimit() {
+  store.setContextLimit(contextLimitInput.value);
+  contextLimitInput.value = store.contextLimit;
+  store.appendLog("context", `上下文窗口设置为 ${(store.contextLimit / 1000).toFixed(0)}k Tokens`);
 }
 
 // 当前激活 Tab 的类型（用于显示预览/编辑切换按钮）
@@ -1473,6 +1634,7 @@ async function withdrawMessage(i: number) {
   // 4. 消息内容回填输入框
   chatInput.value = msg.content;
   aiContextFiles.value = [];
+  store.clearPastedImage();
   nextTick(() => {
     if (aiInputRef.value) { aiInputRef.value.focus(); autoResizeAIInput(); }
   });
@@ -1509,30 +1671,55 @@ async function reloadOpenTabs() {
   }
 }
 
-// 粘贴图片（多模态开启时）：读剪贴板 → 存临时文件 → 记为待发送图片
+/**
+ * 粘贴图片：
+ * - 模型原生支持多模态，或已开启视觉引擎 → 读剪贴板图片 → 存临时文件 → 加入待发送图片（最多 6 张）
+ * - 纯文本模型且未配置视觉引擎 → 拦截并提示"请配置视觉引擎使用"
+ */
 async function onPasteImage(e: ClipboardEvent) {
-  if (!multimodalEnabled.value) return;
   const items = e.clipboardData?.items; if (!items) return;
+  // 找出剪贴板中的图片项
+  const imageItems: DataTransferItem[] = [];
   for (let i = 0; i < items.length; i++) {
     const it = items[i];
-    if (it.kind === "file" && it.type.startsWith("image/")) {
-      e.preventDefault();
-      const file = it.getAsFile(); if (!file) return;
-      const ext = (file.type.split("/")[1] || "png").replace("jpeg", "jpg");
-      const reader = new FileReader();
-      reader.onload = async () => {
-        const dataUrl = String(reader.result || "");
-        await store.setPastedImageFromBase64(dataUrl, ext);
-      };
-      reader.readAsDataURL(file);
-      return;
+    if (it.kind === "file" && it.type.startsWith("image/")) imageItems.push(it);
+  }
+  if (imageItems.length === 0) return;
+
+  // 纯文本模型 + 未开启视觉引擎：明确提示
+  if (!canPasteImage.value) {
+    e.preventDefault();
+    alert("这是纯文本模型，请配置视觉引擎使用：\n\n打开「AI配置」→ 勾选「视觉引擎」→ 填写 Vision API Key / Base URL / Model。\n配置后粘贴的图片会先由视觉引擎转译为文本，再交给主模型推理。");
+    store.appendLog("system", "粘贴图片被拦截：纯文本模型且未配置视觉引擎");
+    return;
+  }
+
+  e.preventDefault();
+  let added = 0;
+  for (const it of imageItems) {
+    if (store.pastedImages.length >= MAX_PASTE_IMAGES) {
+      alert(`每次提问最多 ${MAX_PASTE_IMAGES} 张图片。`);
+      break;
     }
+    const file = it.getAsFile(); if (!file) continue;
+    const ext = (file.type.split("/")[1] || "png").replace("jpeg", "jpg");
+    const dataUrl = await new Promise<string>((resolve) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result || ""));
+      reader.readAsDataURL(file);
+    });
+    if (!dataUrl) continue;
+    if (await store.addPastedImage(dataUrl, ext)) added++;
+  }
+  if (added > 0) {
+    await nextTick();
+    autoResizeAIInput();
   }
 }
 function autoResizeAIInput() {
   const input = aiInputRef.value; if (!input) return;
   input.style.height = "auto";
-  input.style.height = Math.min(Math.max(input.scrollHeight, 80), 300) + "px";
+  input.style.height = Math.min(Math.max(input.scrollHeight, 120), 420) + "px";
 }
 function saveAIConfig() { saveApiConfig(); } // deprecated, kept for ref
 async function saveApiConfig() {
@@ -1545,23 +1732,36 @@ async function saveApiConfig() {
   showAIConfigModal.value = false;
 }
 
-// ─── 视觉识别（DeepSeek-OCR / ModLens） ───
+// ─── 视觉引擎 / 上下文配置 ───
+/** 勾选「工具」= 默认 Agent 模式（走 9 工具 Agent Loop） */
 function toggleTools(e: Event) {
   store.useTools = (e.target as HTMLInputElement).checked;
   localStorage.setItem("deep-ide-tools", JSON.stringify(store.useTools));
-  store.addSystemMessage(store.useTools ? "已开启工具（9 工具 Agent Loop）" : "已关闭工具");
+  store.addSystemMessage(
+    store.useTools
+      ? "已开启工具 → 默认 Agent 模式（9 工具 Agent Loop，自主调用直到得出结论）"
+      : "已关闭工具 → 对话模式（仅单轮回复，不调用工具）"
+  );
+  store.appendLog("mode", store.useTools ? "启用 Agent 模式（工具已勾选）" : "切换为对话模式（工具已关闭）");
 }
 function toggleMaxMode(e: Event) {
   maxMode.value = (e.target as HTMLInputElement).checked;
   localStorage.setItem("deep-ide-max-mode", JSON.stringify(maxMode.value));
   store.addSystemMessage(maxMode.value ? "已开启最大能力模式（9 工具 Agent Loop）" : "已关闭最大能力模式");
+  store.appendLog("mode", maxMode.value ? "开启 max 最大能力模式" : "关闭 max 最大能力模式");
 }
 function toggleMultimodal(e: Event) {
   multimodalEnabled.value = (e.target as HTMLInputElement).checked;
   localStorage.setItem("deep-ide-multimodal", JSON.stringify(multimodalEnabled.value));
-  store.addSystemMessage(multimodalEnabled.value ? "已开启多模态（识图）" : "已切换为纯文本模式");
+  store.addSystemMessage(multimodalEnabled.value ? "已开启视觉引擎（识图）" : "已切换为纯文本模式");
+  store.appendLog("mode", multimodalEnabled.value ? "开启视觉引擎（识图）" : "关闭视觉引擎，切换为纯文本模式");
+  // 纯文本模型 + 未配置视觉引擎：提示需要搭配视觉引擎使用
+  if (multimodalEnabled.value && visionKeyInput.value.trim() === "" && !modelHasNativeVision.value) {
+    alert("已开启视觉引擎，但尚未填写 Vision API Key。\n请填写下方「视觉引擎」配置（引擎 / Vision API Key / Base URL / Model）后点击「保存视觉引擎」。");
+  }
 }
 async function openAIConfig() {
+  contextLimitInput.value = store.contextLimit;
   await loadVisionConfig();
   showAIConfigModal.value = true;
 }
@@ -1571,6 +1771,7 @@ async function saveVisionConfig() {
     localStorage.setItem("deep-ide-vision-config", JSON.stringify({
       provider: visionProvider.value, key: visionKeyInput.value, baseUrl: visionBaseUrl.value, model: visionModel.value,
     }));
+    if (visionKeyInput.value.trim()) multimodalEnabled.value = true;
     alert("视觉引擎已保存：" + visionProvider.value + " / " + visionModel.value);
   } catch (e: any) {
     alert("保存视觉引擎失败: " + e);
