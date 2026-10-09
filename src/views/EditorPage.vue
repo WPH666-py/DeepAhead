@@ -16,6 +16,11 @@
           <div class="dropdown-divider"></div>
           <div class="dropdown-item" @click="closeProject">关闭项目</div>
           <div class="dropdown-divider"></div>
+          <!-- 更新：点击即检查并直接开始「下载 → 卸载旧版 → 安装新版」 -->
+          <div class="dropdown-item" @click="updateFromMenu">
+            🔄 更新 DeepAhead<template v-if="appVersion">（当前 {{ appVersion }}）</template>
+          </div>
+          <div class="dropdown-divider"></div>
           <div class="dropdown-item" style="color:#e74c3c" @click="uninstallApp">卸载 DeepAhead</div>
           <div class="dropdown-item" style="color:#e74c3c" @click="exitApp">退出</div>
         </div>
@@ -1374,6 +1379,12 @@ function appendUpdateLog(info: UpdateInfo) {
  * 直到用户点击"立即更新"为止（跨重启也继续，因为待更新版本已落盘）。
  */
 function snoozeUpdate() {
+  // 更新已经在进行中时不允许"暂不更新"：否则下载会在后台跑完并把应用重启，
+  // 而界面却显示成"已推迟"，行为会让人措手不及。
+  if (updateBusy.value) {
+    alert("更新正在进行中，无法推迟。下载完成后应用会自动退出并安装新版本。");
+    return;
+  }
   showUpdateModal.value = false;
   store.appendLog("system", "已选择暂不更新（10 分钟后再次提醒）");
   if (updateRemindTimer) clearInterval(updateRemindTimer);
@@ -1947,9 +1958,42 @@ onMounted(async () => {
   updateCheckTimer = setInterval(() => { checkForUpdate(); }, 6 * 60 * 60 * 1000);
 });
 
-/** 手动检查更新（AI 驾驶舱菜单入口；也是排查"为什么没提示"的手段） */
-async function manualCheckUpdate() {
+/**
+ * 「开始 → 更新 DeepAhead」：点击后直接走完整更新流程
+ * （检查 → 下载 → 退出 → 静默卸载旧版 → 静默安装新版 → 重启）。
+ * 用户已经明确点了「更新」，所以不再二次确认；只在"已是最新/无法更新"时给提示。
+ */
+async function updateFromMenu() {
   closeDropdowns();
+  updateBusy.value = false;
+  updatePhase.value = "idle";
+  const info = await tauriAPI.checkUpdate().catch(() => null);
+  updateInfo.value = info;
+  if (!info) {
+    alert("检查更新失败：无法访问 Gitee（请检查网络后重试）。");
+    return;
+  }
+  appendUpdateLog(info);
+  if (info.error) {
+    alert(`检查更新失败：${info.error}`);
+    return;
+  }
+  if (!info.has_update) {
+    alert(`当前已是最新版本。\n\n当前版本：${info.current}\nGitee 最新：${info.latest || "(无发布)"}`);
+    return;
+  }
+  if (!info.asset) {
+    alert(`发现新版本 ${info.latest}，但该发布下没有安装包附件，无法自动更新。\n请手动到 Gitee Releases 下载。`);
+    return;
+  }
+  // 直接开始：展示进度框并立刻下载安装
+  localStorage.setItem("deep-ide-pending-update", info.latest);
+  showUpdateModal.value = true;
+  await startUpdate();
+}
+
+/** 手动检查更新（AI 驾驶舱菜单入口；也是排查"为什么没提示"的手段） */
+async function manualCheckUpdate() {  closeDropdowns();
   const info = await tauriAPI.checkUpdate().catch((e) => null);
   updateInfo.value = info;
   if (!info) {
