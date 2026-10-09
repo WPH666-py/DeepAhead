@@ -75,6 +75,30 @@ export interface MemoryConfigInfo {
   allowlist: string[];
   fail_open: boolean;
 }
+
+// ─── 回合末裁决卡片（dsh-rule-engine-client 移植）───
+export interface TurnCardBlock {
+  i: number;
+  tool: string;
+  args: string;
+  rule_id: string;
+  title: string;
+  reason: string;
+  err_id: string;
+  /** "" | "correct" | "incorrect" —— 非空即锁定（判例一次性） */
+  label: string;
+  labeled_at: number;
+}
+export interface TurnCard {
+  key: string;
+  session_id: string;
+  message_id: string;
+  turn: number;
+  user_text: string;
+  blocks: TurnCardBlock[];
+  verdict: string;
+  at: number;
+}
 export interface CompressResult {
   before_tokens: number;
   after_tokens: number;
@@ -214,6 +238,18 @@ export const tauriAPI = {
   rulesAudit: (limit?: number) => invoke<{ records: any[]; path: string }>("rules_audit", { limit: limit ?? null }),
   rulesTestGuard: (tool: string, args?: any, userText?: string) =>
     invoke<any>("rules_test_guard", { tool, arguments: args ?? null, userText: userText ?? null }),
+  rulesGetConfig: () => invoke<any>("rules_get_config"),
+  rulesSetToggles: (patch: { enabled?: boolean; turn_card_enabled?: boolean; task_contract_enabled?: boolean }) =>
+    invoke<any>("rules_set_toggles", patch),
+  rulesGuardCommand: (input: string) => invoke<{ ok: boolean; text: string }>("rules_guard_command", { input }),
+  rulesTurnCards: (sessionId?: string, limit?: number) =>
+    invoke<{ cards: TurnCard[]; path: string }>("rules_turn_cards", { sessionId: sessionId ?? null, limit: limit ?? null }),
+  rulesRateTurnCard: (key: string, blockIndex: number, verdict: string, expectedVerdict?: string) =>
+    invoke<TurnCard>("rules_rate_turn_card", { key, blockIndex, verdict, expectedVerdict: expectedVerdict ?? null }),
+  rulesAttachTurnCard: (key: string, messageId: string) =>
+    invoke<TurnCard>("rules_attach_turn_card", { key, messageId }),
+  rulesLabels: () => invoke<{ labels: { fingerprint: string; label: string; at: number; expires_at: number }[] }>("rules_labels"),
+  rulesFingerprint: (command: string) => invoke<{ fingerprint: string | null }>("rules_fingerprint", { command }),
 
   // ─── 费用统计（dsh-cost-meter 移植）───
   costSnapshot: () => invoke<Record<string, any>>("cost_snapshot"),

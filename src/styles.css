@@ -649,6 +649,60 @@ body {
     font-size: 0.7rem; line-height: 1.55; color: #444;
     white-space: pre-wrap; overflow-wrap: anywhere; max-height: 420px; overflow-y: auto;
 }
+.cap-cmdbar { display: flex; gap: 0.4rem; align-items: center; margin-top: 0.3rem; }
+.cap-cmdbar input {
+    flex: 1; min-width: 0; padding: 0.4rem 0.55rem; border: 1px solid #e0e0e0;
+    border-radius: 5px; font-size: 0.78rem; outline: none;
+    font-family: 'Cascadia Code','Consolas',monospace;
+}
+.cap-link {
+    flex-shrink: 0; border: none; background: transparent; color: #1a73e8;
+    font-size: 0.72rem; cursor: pointer; text-decoration: underline; padding: 0 0.2rem;
+}
+
+/* ========== 回合末裁决卡片（dsh-rule-engine-client 移植） ========== */
+.turn-card {
+    margin-top: 0.5rem; border: 1px solid #e6e9ec; border-radius: 8px;
+    background: #fbfcfd; overflow: hidden;
+}
+.turn-card-head {
+    display: flex; align-items: baseline; justify-content: space-between; gap: 0.4rem;
+    padding: 0.35rem 0.6rem; background: #f4f6f8; border-bottom: 1px solid #e6e9ec;
+}
+.turn-card-title { font-size: 0.76rem; font-weight: 600; color: #333; }
+.turn-card-progress { font-size: 0.68rem; color: #8a919f; }
+.turn-card-block {
+    padding: 0.45rem 0.6rem; border-bottom: 1px solid #f2f4f6;
+    display: flex; flex-direction: column; gap: 2px;
+}
+.turn-card-block:last-of-type { border-bottom: none; }
+.turn-card-block-top { display: flex; align-items: baseline; gap: 0.4rem; flex-wrap: wrap; }
+.turn-card-rule {
+    padding: 1px 6px; border-radius: 999px; font-size: 0.66rem; font-weight: 600;
+    background: #ffece8; color: #d92d20;
+}
+.turn-card-tool { font-size: 0.7rem; color: #4e5969; font-family: 'Cascadia Code','Consolas',monospace; }
+.turn-card-locked { font-size: 0.66rem; font-weight: 600; margin-left: auto; }
+.turn-card-locked.correct { color: #067647; }
+.turn-card-locked.incorrect { color: #d92d20; }
+.turn-card-args {
+    font-size: 0.7rem; color: #4e5969; font-family: 'Cascadia Code','Consolas',monospace;
+    overflow-wrap: anywhere;
+}
+.turn-card-reason { font-size: 0.7rem; color: #8a919f; line-height: 1.5; overflow-wrap: anywhere; }
+.turn-card-actions { display: flex; gap: 0.35rem; margin-top: 0.25rem; }
+.turn-card-btn {
+    padding: 3px 10px; border-radius: 10px; cursor: pointer;
+    font-size: 0.72rem; font-weight: 500;
+}
+.turn-card-btn.ok { border: 1px solid #b7e3c4; background: #e8f7ef; color: #067647; }
+.turn-card-btn.ok:hover { background: #067647; color: #fff; border-color: #067647; }
+.turn-card-btn.no { border: 1px solid #fbd4d0; background: #fff1f0; color: #d92d20; }
+.turn-card-btn.no:hover { background: #d92d20; color: #fff; border-color: #d92d20; }
+.turn-card-foot {
+    padding: 0.3rem 0.6rem; font-size: 0.66rem; color: #a8afb8;
+    background: #f8f9fb; border-top: 1px solid #f2f4f6;
+}
 .agent-tool-header {
     display: flex; align-items: center; gap: 6px; cursor: pointer;
     padding: 3px 6px; border-radius: 3px; flex-wrap: nowrap;

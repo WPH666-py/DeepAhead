@@ -705,6 +705,82 @@ pub fn rules_test_guard(
     serde_json::to_value(d).unwrap_or(serde_json::json!({}))
 }
 
+/// 读取规则引擎配置（开关 / 未知工具策略 / 裁决卡片）
+#[tauri::command]
+pub fn rules_get_config() -> serde_json::Value {
+    serde_json::to_value(crate::ai::rules_engine::get_config())
+        .unwrap_or(serde_json::json!({}))
+}
+
+/// 应用界面开关（即时影响 agent loop 的硬门与裁决卡片）
+#[tauri::command]
+pub fn rules_set_toggles(
+    enabled: Option<bool>,
+    turn_card_enabled: Option<bool>,
+    task_contract_enabled: Option<bool>,
+) -> serde_json::Value {
+    let cfg = crate::ai::rules_engine::set_ui_toggles(enabled, turn_card_enabled, task_contract_enabled);
+    serde_json::to_value(cfg).unwrap_or(serde_json::json!({}))
+}
+
+/// 执行一条 /guard 命令（面板内命令行）
+#[tauri::command]
+pub fn rules_guard_command(input: String) -> serde_json::Value {
+    let mut cfg = crate::ai::rules_engine::get_config();
+    let mut st = crate::ai::rules_engine::RuleEngineState::default();
+    st.rules = crate::ai::rules_engine::load_rules_from_home();
+    let r = crate::ai::rules_engine::run_guard_command(&mut cfg, &mut st, &input);
+    // unlock / bypass 等运行期窗口写回全局，下一次 Agent 运行即刻生效
+    crate::ai::rules_engine::apply_runtime_windows(cfg.unlock_until, cfg.bypass_until);
+    serde_json::to_value(r).unwrap_or(serde_json::json!({"ok": false, "text": "命令执行失败"}))
+}
+
+/// 回合裁决卡片列表
+#[tauri::command]
+pub fn rules_turn_cards(session_id: Option<String>, limit: Option<usize>) -> serde_json::Value {
+    let cards = crate::ai::rules_engine::list_turn_cards(session_id.as_deref(), limit);
+    serde_json::json!({
+        "cards": cards,
+        "path": crate::ai::rules_engine::turn_cards_path().to_string_lossy().to_string(),
+    })
+}
+
+/// 判例登记（一次性）：✅拦对了 / ❌拦错了
+#[tauri::command]
+pub fn rules_rate_turn_card(
+    key: String,
+    block_index: usize,
+    verdict: String,
+    expected_verdict: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let card = crate::ai::rules_engine::rate_turn_card(
+        &key,
+        block_index,
+        &verdict,
+        expected_verdict.as_deref(),
+    )?;
+    serde_json::to_value(card).map_err(|e| e.to_string())
+}
+
+/// 把卡片挂到某条助手消息上
+#[tauri::command]
+pub fn rules_attach_turn_card(key: String, message_id: String) -> Result<serde_json::Value, String> {
+    let card = crate::ai::rules_engine::attach_turn_card(&key, &message_id)?;
+    serde_json::to_value(card).map_err(|e| e.to_string())
+}
+
+/// 已登记的指纹放行（7 天判例）
+#[tauri::command]
+pub fn rules_labels() -> serde_json::Value {
+    serde_json::json!({ "labels": crate::ai::rules_engine::load_labels() })
+}
+
+/// 计算一条命令的指纹（界面自检 / 手动撤销用）
+#[tauri::command]
+pub fn rules_fingerprint(command: String) -> serde_json::Value {
+    serde_json::json!({ "fingerprint": crate::ai::rules_engine::fingerprint_of(&command) })
+}
+
 /// ════════════════════════════════════════════════════════
 /// 费用统计（移植自 dsh-cost-meter）
 /// ════════════════════════════════════════════════════════

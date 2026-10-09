@@ -106,6 +106,8 @@ pub enum AgentEventKind {
     ContextCompressed { before_tokens: usize, after_tokens: usize },
     /// 实时上下文占用（每轮推送；tokens = 当前对话占用 Token 估算值）
     ContextUsage { tokens: usize },
+    /// 回合末裁决卡片（本轮有工具被硬门拦下时推送；前端据此渲染 ✅/❌ 卡片）
+    TurnCard { card: Value },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -331,8 +333,13 @@ where
     rule_state.real_user_seen = true;
     rule_state.user_text = input.user_message.clone();
     rule_state.has_execute_clause = crate::ai::rules_engine::has_execute_clause(&input.user_message);
-    let rule_cfg = crate::ai::rules_engine::RuleEngineConfig::default();
+    let rule_cfg = crate::ai::rules_engine::get_config();
     let guard_enabled = rule_cfg.enabled;
+    // 把界面设置的 unlock / bypass 窗口同步给本次运行（运行期可被 /guard 改动）
+    let mut rule_cfg = rule_cfg;
+    rule_cfg.unlock_until = rule_cfg.unlock_until.max(0);
+    // 回合末裁决卡片的被拦记录（对齐 dsh-rule-engine-client 的卡片契约）
+    let mut turn_blocks: Vec<crate::ai::rules_engine::TurnCardBlock> = Vec::new();
 
     // 3. 主循环（max_iterations = 0 表示不限步数：直到模型给出结论或出错才结束）
     let mut iter: usize = 0;
@@ -517,7 +524,7 @@ where
             events.push(ev.clone());
             on_event(ev);
             memory_auto_ingest(&input.memory, &input.run_id, &input.user_message, &final_content);
-            // ─── 费用记账（dsh-cost-meter 移植）───
+            emit_turn_card(&rule_cfg, &input.run_id, &input.user_message, &turn_blocks, &mut on_event, &mut events);
             cost_record(
                 &input.mode, &input.run_id,
                 cost_input, cost_output, cost_cache_hit, cost_cache_miss, cost_reasoning,
@@ -608,6 +615,14 @@ where
                     &decision.err_id,
                 );
                 if !decision.allow {
+                    // 记入回合裁决卡片（每条独立可判）
+                    turn_blocks.push(crate::ai::rules_engine::make_card_block(
+                        turn_blocks.len(),
+                        &call_with_parsed_args.function.name,
+                        &call_with_parsed_args.function.arguments,
+                        &decision,
+                        &format!("工具 {} 被规则 {} 拦下", call_with_parsed_args.function.name, decision.rule_id),
+                    ));
                     let reason = decision.reason.clone();
                     messages.push(tool_result_message(
                         &call_with_parsed_args.id,
@@ -754,6 +769,7 @@ where
     on_event(ev);
 
     memory_auto_ingest(&input.memory, &input.run_id, &input.user_message, &final_content);
+    emit_turn_card(&rule_cfg, &input.run_id, &input.user_message, &turn_blocks, &mut on_event, &mut events);
     cost_record(
         &input.mode, &input.run_id,
         cost_input, cost_output, cost_cache_hit, cost_cache_miss, cost_reasoning,
@@ -774,6 +790,31 @@ where
 // ════════════════════════════════════════════════════════
 // 辅助函数
 // ════════════════════════════════════════════════════════
+
+/// 回合末生成裁决卡片（对齐 dsh-rule-engine-client：一条被拦记录都没有时不产生卡片）。
+/// 默认关闭（`turn_card_enabled = false`），与上游"面向大众默认关"一致。
+fn emit_turn_card(
+    cfg: &crate::ai::rules_engine::RuleEngineConfig,
+    session_id: &str,
+    user_message: &str,
+    blocks: &[crate::ai::rules_engine::TurnCardBlock],
+    on_event: &mut dyn FnMut(AgentEvent),
+    events: &mut Vec<AgentEvent>,
+) {
+    if !cfg.turn_card_enabled || blocks.is_empty() {
+        return;
+    }
+    match crate::ai::rules_engine::record_turn_card(session_id, 1, user_message, blocks.to_vec()) {
+        Ok(card) => {
+            if let Ok(v) = serde_json::to_value(&card) {
+                let ev = AgentEvent::new(AgentEventKind::TurnCard { card: v });
+                events.push(ev.clone());
+                on_event(ev);
+            }
+        }
+        Err(_) => { /* 卡片落盘失败不能影响主流程 */ }
+    }
+}
 
 /// 费用记账（移植自 dsh-cost-meter）：一次 Agent 运行累计的 token 用量记一笔。
 /// 记账失败必须被吞掉——计量不能拖垮主流程。

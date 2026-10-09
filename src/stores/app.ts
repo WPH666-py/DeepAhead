@@ -1,6 +1,6 @@
 import { defineStore, acceptHMRUpdate } from "pinia";
 import { ref, computed } from "vue";
-import { tauriAPI, type ModeInfo, type Message, type AgentDef, type FileEntry } from "../services/tauri-api";
+import { tauriAPI, type ModeInfo, type Message, type AgentDef, type FileEntry, type TurnCard } from "../services/tauri-api";
 import type { EditorTheme } from "../utils/codemirror";
 import { applySkin, type SkinVariant } from "../utils/skins";
 
@@ -95,6 +95,38 @@ export const useAppStore = defineStore("app", () => {
   // ─── 待发送的粘贴图片（每次提问最多 MAX_PASTE_IMAGES 张）───
   // preview 用于缩略图展示，path 用于发送时交给视觉引擎识别
   const pastedImages = ref<ImageAttachment[]>([]);
+
+  // ─── 回合末裁决卡片（dsh-rule-engine-client 移植）───
+  // 按 card.key 索引；message_id 回填后可挂在对应助手消息下渲染
+  const turnCards = ref<Record<string, TurnCard>>({});
+  /** 取某条消息上的裁决卡片（无则 undefined） */
+  function turnCardForMessage(messageId: string): TurnCard | undefined {
+    return Object.values(turnCards.value).find(c => c.message_id === messageId);
+  }
+  /** 登记判例（一次性）：✅ 拦对了 / ❌ 拦错了 */
+  async function rateTurnCard(key: string, blockIndex: number, verdict: "correct" | "incorrect") {
+    try {
+      const card = await tauriAPI.rulesRateTurnCard(key, blockIndex, verdict);
+      turnCards.value = { ...turnCards.value, [card.key]: card };
+      const blk = card.blocks.find(b => b.i === blockIndex);
+      appendLog(
+        "system",
+        verdict === "correct" ? "判例登记：拦对了" : "判例登记：拦错了（同类命令学习放行 7 天）",
+        blk ? `规则 ${blk.rule_id}｜${blk.tool}：${blk.args}` : undefined
+      );
+    } catch (e: any) {
+      addSystemMessage(`判例登记失败: ${e}`);
+    }
+  }
+  /** 载入已落盘的裁决卡片（重启后仍可跨回合补裁） */
+  async function loadTurnCards(sessionId?: string) {
+    try {
+      const r = await tauriAPI.rulesTurnCards(sessionId, 200);
+      const map: Record<string, TurnCard> = {};
+      for (const c of r.cards || []) map[c.key] = c;
+      turnCards.value = { ...turnCards.value, ...map };
+    } catch (_) { /* 读取失败静默 */ }
+  }
 
   // Agent Loop 工具调用追踪
   const toolCalls = ref<Array<{
@@ -314,7 +346,7 @@ export const useAppStore = defineStore("app", () => {
     try {
       // 订阅事件，实时更新 toolCalls 状态
       const { listen } = await import("@tauri-apps/api/event");
-      unlisten = await listen("ai-agent-event", (event: any) => {
+      unlisten = await listen("ai-agent-event", async (event: any) => {
         const ev = event.payload;
         if (!ev || !ev.kind || !ev.kind.type) return;
         const k = ev.kind;
@@ -375,6 +407,26 @@ export const useAppStore = defineStore("app", () => {
           } else if (k.type === "context_usage") {
             // 实时上下文占用（后端每轮推送）
             applyContextUsage(k.tokens || 0);
+          } else if (k.type === "turn_card") {
+            // 回合末裁决卡片：挂到本轮助手消息上（对齐 dsh-rule-engine-client）
+            const card = k.card;
+            if (card && card.key) {
+              const lastAssistant = [...messages.value].reverse().find(m => m.role === "assistant");
+              card.message_id = lastAssistant?.id || "";
+              turnCards.value = { ...turnCards.value, [card.key]: card };
+              // 把 messageId 落盘：重启后仍能把卡片挂回原消息（可跨回合补裁）
+              if (card.message_id) {
+                try {
+                  const saved = await tauriAPI.rulesAttachTurnCard(card.key, card.message_id);
+                  turnCards.value = { ...turnCards.value, [saved.key]: saved };
+                } catch (_) { /* 落盘失败不影响展示 */ }
+              }
+              appendLog(
+                "system",
+                `⚖️ 回合裁决卡片：${card.blocks?.length || 0} 条被拦记录`,
+                "可在对话中逐条判定「拦对了 / 拦错了」（❌ 会使同类命令学习放行）"
+              );
+            }
           } else if (k.type === "context_compressed") {
             const before = (k.before_tokens || 0) / 1000;
             const after = (k.after_tokens || 0) / 1000;
@@ -747,6 +799,8 @@ export const useAppStore = defineStore("app", () => {
     compressContextManually, maybeAutoCompressContext,
     // 清空会话（保留日志）
     clearSession,
+    // 回合末裁决卡片（dsh-rule-engine-client 移植）
+    turnCards, turnCardForMessage, rateTurnCard, loadTurnCards,
   };
 });
 

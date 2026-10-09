@@ -193,6 +193,33 @@
                 title="撤回该对话：内容回到输入框，并撤销本轮代码修改与结果"
                 @click="withdrawMessage(i)"
               >↩ 撤回</button>
+              <!-- 回合末裁决卡片（dsh-rule-engine-client 移植）：逐条独立判定，判例一次性锁定 -->
+              <div v-if="msg.role === 'assistant' && msg.id && turnCardsByMsg[msg.id]" class="turn-card">
+                <div class="turn-card-head">
+                  <span class="turn-card-title">⚖️ 回合裁决</span>
+                  <span class="turn-card-progress">{{ labeledCount(turnCardsByMsg[msg.id]) }}/{{ turnCardsByMsg[msg.id].blocks.length }} 已判</span>
+                </div>
+                <div
+                  v-for="blk in turnCardsByMsg[msg.id].blocks"
+                  :key="blk.i"
+                  class="turn-card-block"
+                >
+                  <div class="turn-card-block-top">
+                    <span class="turn-card-rule">规则 {{ blk.rule_id || '?' }}</span>
+                    <span class="turn-card-tool">{{ blk.tool }}</span>
+                    <span v-if="blk.label" class="turn-card-locked" :class="blk.label">
+                      {{ blk.label === 'correct' ? '✓ 已判：拦对了' : '✗ 已判：拦错了' }}
+                    </span>
+                  </div>
+                  <div class="turn-card-args">{{ blk.args }}</div>
+                  <div class="turn-card-reason">{{ blk.reason }}</div>
+                  <div v-if="!blk.label" class="turn-card-actions">
+                    <button class="turn-card-btn ok" @click="store.rateTurnCard(turnCardsByMsg[msg.id].key, blk.i, 'correct')">✅ 拦对了</button>
+                    <button class="turn-card-btn no" @click="store.rateTurnCard(turnCardsByMsg[msg.id].key, blk.i, 'incorrect')">❌ 拦错了</button>
+                  </div>
+                </div>
+                <div class="turn-card-foot">判例一次性锁定；❌ 会使同指纹命令学习放行（可用 /guard label clear 撤销）</div>
+              </div>
             </div>
             <div v-if="store.isLoading" class="message ai-message"><div class="msg-role">AI</div><div class="msg-content">{{ store.streamingContent || '思考中...' }}</div></div>
           </div>
@@ -911,6 +938,35 @@
                 </div>
               </div>
               <div v-else class="cap-hint">暂无审计记录。</div>
+              <!-- 回合末裁决卡片：与任务契约同组，默认关闭（对齐上游） -->
+              <div class="cap-sub">开关</div>
+              <label class="cap-check">
+                <input type="checkbox" :checked="rulesCfg?.turn_card_enabled" @change="onRulesToggle('turn_card_enabled', $event)">
+                <span>回合末裁决卡片（默认关；开启后每轮被拦记录会生成 ✅/❌ 可判卡片）</span>
+              </label>
+              <label class="cap-check">
+                <input type="checkbox" :checked="rulesCfg?.task_contract_enabled" @change="onRulesToggle('task_contract_enabled', $event)">
+                <span>任务契约（与裁决卡片同组，默认关）</span>
+              </label>
+              <!-- /guard 命令行 -->
+              <div class="cap-sub">/guard 命令行</div>
+              <div class="cap-cmdbar">
+                <input
+                  v-model="guardCommand"
+                  placeholder="如 /guard status、/guard log 20、/guard unlock 10、/guard label clear <指纹>"
+                  @keyup.enter="runGuard"
+                >
+                <button class="btn btn-primary" style="font-size:0.78rem;white-space:nowrap" :disabled="guardBusy" @click="runGuard">执行</button>
+              </div>
+              <pre v-if="guardOutput" class="cap-pre">{{ guardOutput }}</pre>
+              <div v-if="rulesLabels.length" class="cap-sub">指纹放行（7 天判例）</div>
+              <div v-if="rulesLabels.length" class="cap-list">
+                <div v-for="l in rulesLabels" :key="l.fingerprint" class="cap-list-item">
+                  <span class="cap-badge">{{ l.label }}</span>
+                  <span class="cap-list-text cap-mono">{{ l.fingerprint }} · 剩余 {{ Math.max(0, Math.round((l.expires_at - Date.now() / 1000) / 3600)) }} 小时</span>
+                  <button class="cap-link" @click="revokeLabel(l.fingerprint)">撤销</button>
+                </div>
+              </div>
             </template>
             <div class="cap-actions"><button class="btn btn-secondary" style="font-size:0.78rem" @click="refreshRules">刷新</button></div>
           </template>
@@ -941,7 +997,7 @@
 import { ref, onMounted, nextTick, watch, computed } from "vue";
 import { useAppStore, MAX_PASTE_IMAGES, type LogKind } from "../stores/app";
 import { tauriAPI } from "../services/tauri-api";
-import type { GitGraphCommit, GitGraphLaneRow, LaneGlyph } from "../services/tauri-api";
+import type { GitGraphCommit, GitGraphLaneRow, LaneGlyph, TurnCard } from "../services/tauri-api";
 import FileTreeNode from "../components/layout/FileTreeNode.vue";
 import { createEditor, destroyEditor, getEditorContent, setEditorContent, setEditorLanguage, setEditorTheme } from "../utils/codemirror";
 import type { EditorView } from "@codemirror/view";
@@ -1073,8 +1129,20 @@ function clearLogs() {
   store.clearLogs();
   expandedLogs.value = {};
 }
-/** Agent 进度百分比（不限步数时无固定上限，进度条保持进行态） */
-const agentProgressPct = computed(() => {
+/** 回合裁决卡片：按助手消息 id 建索引，便于模板直接取用 */
+const turnCardsByMsg = computed<Record<string, TurnCard>>(() => {
+  const map: Record<string, TurnCard> = {};
+  for (const c of Object.values(store.turnCards)) {
+    if (c.message_id) map[c.message_id] = c;
+  }
+  return map;
+});
+/** 已判定条数（模板中避免内联箭头函数触发类型推断问题） */
+function labeledCount(card: TurnCard): number {
+  return card.blocks.filter((b) => b.label !== "").length;
+}
+
+/** Agent 进度百分比（不限步数时无固定上限，进度条保持进行态） */const agentProgressPct = computed(() => {
   const max = store.agentMaxIterations;
   if (!max || max <= 0) return 0;
   return Math.min((store.agentIterations / max) * 100, 100);
@@ -1172,6 +1240,57 @@ const vetReport = ref<any>(null);
 const vetScorecard = ref("");
 const vetBusy = ref(false);
 const capTab = ref("cost");
+// 规则引擎面板：配置 / /guard 命令行 / 指纹放行
+const rulesCfg = ref<any>(null);
+const guardCommand = ref("");
+const guardOutput = ref("");
+const guardBusy = ref(false);
+const rulesLabels = ref<any[]>([]);
+
+async function refreshRulesConfig() {
+  try {
+    rulesCfg.value = await tauriAPI.rulesGetConfig();
+    const l = await tauriAPI.rulesLabels();
+    rulesLabels.value = l.labels || [];
+  } catch (_) { rulesCfg.value = null; }
+}
+/** 规则引擎开关（即时写回后端全局配置 → 影响下一次 Agent 运行的硬门与裁决卡片） */
+async function onRulesToggle(key: string, e: Event) {
+  const val = (e.target as HTMLInputElement).checked;
+  rulesCfg.value = { ...(rulesCfg.value || {}), [key]: val };
+  localStorage.setItem(`deep-ide-rules-${key}`, JSON.stringify(val));
+  try {
+    rulesCfg.value = await tauriAPI.rulesSetToggles({ [key]: val } as any);
+  } catch (err: any) {
+    store.addSystemMessage(`规则引擎开关写入失败: ${err}`);
+  }
+  store.appendLog("system", `规则引擎 ${key} → ${val ? "开启" : "关闭"}`);
+  if (key === "turn_card_enabled") {
+    store.addSystemMessage(val
+      ? "已开启回合末裁决卡片：被拦记录会生成可判定卡片（✅拦对了 / ❌拦错了）"
+      : "已关闭回合末裁决卡片");
+  }
+}
+async function runGuard() {
+  const cmd = guardCommand.value.trim();
+  if (!cmd) return;
+  guardBusy.value = true;
+  try {
+    const r = await tauriAPI.rulesGuardCommand(cmd.startsWith("/guard") ? cmd : `/guard ${cmd}`);
+    guardOutput.value = r.text;
+    store.appendLog("system", `${cmd.startsWith("/guard") ? cmd : "/guard " + cmd}`, r.text.slice(0, 300));
+    await refreshRules();
+    await refreshRulesConfig();
+  } catch (e: any) {
+    guardOutput.value = `执行失败: ${e}`;
+  } finally {
+    guardBusy.value = false;
+  }
+}
+async function revokeLabel(fp: string) {
+  guardCommand.value = `/guard label clear ${fp}`;
+  await runGuard();
+}
 
 async function refreshCost() {
   try { costSnapshot.value = await tauriAPI.costSnapshot(); } catch (_) { costSnapshot.value = null; }
@@ -1196,7 +1315,7 @@ async function refreshRules() {
 }
 /** 加载全部集成能力面板数据 */
 async function refreshCapabilities() {
-  await Promise.all([refreshCost(), refreshCtxEngine(), refreshMemory(), refreshRules()]);
+  await Promise.all([refreshCost(), refreshCtxEngine(), refreshMemory(), refreshRules(), refreshRulesConfig()]);
 }
 async function onMemoryToggle(key: string, e: Event) {
   const val = (e.target as HTMLInputElement).checked;
@@ -1522,6 +1641,14 @@ onMounted(async () => {
     } catch (_) {}
   }
   loadInstalledExtensions();
+  // 恢复规则引擎开关（裁决卡片 / 任务契约），写回后端全局配置
+  try {
+    const tc = JSON.parse(localStorage.getItem("deep-ide-rules-turn_card_enabled") || "false");
+    const tk = JSON.parse(localStorage.getItem("deep-ide-rules-task_contract_enabled") || "false");
+    await tauriAPI.rulesSetToggles({ turn_card_enabled: tc, task_contract_enabled: tk });
+  } catch (_) {}
+  // 恢复已落盘的回合裁决卡片（重启后仍可跨回合补裁）
+  await store.loadTurnCards();
   // 初始化上下文占用显示（无需等待首次 Agent 运行）
   store.recomputeContextUsage();
 });
