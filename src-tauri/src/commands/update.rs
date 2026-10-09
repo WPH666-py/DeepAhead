@@ -42,6 +42,14 @@ pub async fn download_update(
     Ok(path.to_string_lossy().to_string())
 }
 
+/// 取消正在进行的安装包下载。
+/// 前端在用户点「取消下载」或关闭更新弹框时调用；半成品文件会被删除。
+#[tauri::command]
+pub fn cancel_update() -> bool {
+    update::cancel_download();
+    true
+}
+
 /// 启动更新：写入游离脚本 → 本进程退出后静默卸载旧版并安装新版
 #[tauri::command]
 pub fn install_update(installer_path: String) -> Result<String, String> {

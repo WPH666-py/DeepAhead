@@ -4,6 +4,8 @@ pub mod commands;
 pub mod ai;
 pub mod cli;
 pub mod update;
+/// 内置发布说明（由 build.rs 从 docs/releases/v*.md 生成）
+pub mod release_notes;
 
 pub use ai::{ApprovalGate, ApprovalMode, DeepSeekClient, UndoStore};
 

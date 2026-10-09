@@ -134,6 +134,7 @@ fn main() {
             commands::app_version,
             commands::check_update,
             commands::download_update,
+            commands::cancel_update,
             commands::install_update,
             commands::uninstall_now,
             commands::update_helper_log,

@@ -81,27 +81,47 @@ $git = "D:\projects-py\git-portable\cmd\git.exe"
 需要一枚 Gitee 私人令牌（**只存本地，不要提交进仓库**）：
 Gitee → 设置 → 私人令牌 → 生成，勾选 `projects` 权限。
 
+> ⚠️ **坑 3（踩过两次）**：**不要用 PowerShell 的 `Invoke-RestMethod -Body` 发中文正文**。
+> 它按 `ISO-8859-1` 编码 body，写进 Gitee 的中文会变成「鎵ц璁稿彲」这种乱码，而且**改不回来**。
+> 正确做法：把 JSON 用 .NET 写成**无 BOM 的 UTF-8 文件**，再 `curl --data-binary @file` 提交。
+>
+> 另外 Gitee 的 `body` 字段有长度上限（约 1500 字符会 400 `body is invalid`），
+> 发布说明要精简，详细内容留在仓库 `docs/releases/`。
+>
+> 即使远端正文写坏了，**用户端也不会看到乱码**：程序内置了发布说明
+> （构建时把 `docs/releases/v*.md` 打进二进制，见 `src-tauri/build.rs`），
+> 远端正文只在通过乱码校验时才作为补充。
+
 ```powershell
 $env:GITEE_TOKEN = "<你的 Gitee 私人令牌>"
-$v = "0.5.5"
+$v = "0.5.6"
 $notes = Get-Content "docs\releases\v$v.md" -Raw
 $body = @{
-  access_token = $env:GITEE_TOKEN
-  tag_name     = "v$v"
-  name         = "DeepAhead v$v"
-  body         = $notes
+  access_token     = $env:GITEE_TOKEN
+  tag_name         = "v$v"
+  name             = "DeepAhead v$v"
+  body             = $notes
   target_commitish = "main"
 } | ConvertTo-Json -Depth 4
 
-# ① 建 release
-$rel = Invoke-RestMethod -Method Post -Uri "https://gitee.com/api/v5/repos/ph-wang_admin/DeepAhead/releases" `
-        -ContentType "application/json; charset=utf-8" -Body ([Text.Encoding]::UTF8.GetBytes($body))
+# ① 关键：写成无 BOM 的 UTF-8 文件，用 curl 发（PowerShell 直接发会乱码）
+$f = Join-Path $env:TEMP "gitee-release.json"
+[IO.File]::WriteAllBytes($f, (New-Object Text.UTF8Encoding($false)).GetBytes($body))
 
-# ② 传安装包附件（multipart，字段名必须是 file）
+$rel = curl.exe -s -X POST "https://gitee.com/api/v5/repos/ph-wang_admin/DeepAhead/releases" `
+  -H "Content-Type: application/json" --data-binary "@$f" | ConvertFrom-Json
+"release id = $($rel.id)"
+
+# ② 回读校验中文是否完好（这一步不能省）
+(Invoke-RestMethod "https://gitee.com/api/v5/repos/ph-wang_admin/DeepAhead/releases/$($rel.id)").body.Substring(0, 60)
+
+# ③ 传安装包附件（multipart，字段名必须是 file）
 $setup = "src-tauri\target\release\bundle\nsis\DeepAhead_${v}_x64-setup.exe"
 curl.exe -s -X POST "https://gitee.com/api/v5/repos/ph-wang_admin/DeepAhead/releases/$($rel.id)/attach_files" `
   -F "access_token=$env:GITEE_TOKEN" -F "file=@$setup"
 ```
+
+> 附件若重复上传，Gitee 的 API **不支持删除**（DELETE 返回 405），只能在网页上编辑该 Release 手动删。
 
 ### 5.2 GitHub
 

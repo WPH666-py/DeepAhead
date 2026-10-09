@@ -704,7 +704,8 @@
       </div>
     </div>
 
-    <!-- 自动更新弹框：发现新版本 → 暂不更新（10 分钟后再提醒）/ 立即更新 -->
+    <!-- 自动更新弹框：发现新版本 → 暂不更新（10 分钟后再提醒）/ 立即更新
+         下载途中关闭弹框或点「取消下载」= 取消本次下载（后端会删除半成品） -->
     <div class="modal-overlay update-modal" :class="{ show: showUpdateModal }" @click.self="snoozeUpdate">
       <div class="modal-box">
         <!-- 顶部渐变 hero：版本跃迁一眼可见 -->
@@ -765,21 +766,34 @@
             </div>
           </div>
 
-          <!-- 更新说明 -->
+          <!-- 更新说明：最多 11 行，超出内部滚动；乱码会被后端拦掉 -->
           <div v-if="updateInfo?.notes" class="update-notes">
             <div class="update-notes-title">📋 更新内容</div>
-            <pre class="update-notes-body">{{ updateInfo.notes }}</pre>
+            <div class="update-notes-body">{{ updateInfo.notes }}</div>
           </div>
 
-          <div class="update-hint">
+          <div class="update-hint" v-if="updatePhase === 'idle'">
             选择「暂不更新」后每 <b>10 分钟</b>提醒一次，直到你点击「立即更新」。
+          </div>
+          <div class="update-hint" v-else-if="updatePhase === 'downloading'">
+            下载中可随时「取消下载」；关闭本弹框同样视为取消下载，不会安装任何内容。
           </div>
         </div>
 
         <div class="update-actions">
-          <button class="btn btn-secondary" :disabled="updateBusy" @click="snoozeUpdate">暂不更新</button>
-          <button class="btn btn-primary update-go" :disabled="updateBusy" @click="startUpdate">
-            {{ updateBusy ? (updatePhase === 'downloading' ? '下载中…' : '安装中…') : '立即更新' }}
+          <button
+            class="update-btn ghost"
+            :disabled="updatePhase === 'installing'"
+            @click="snoozeUpdate"
+          >{{ updatePhase === 'downloading' ? '取消下载' : '暂不更新' }}</button>
+          <button
+            class="update-btn primary"
+            :disabled="updatePhase === 'installing'"
+            @click="startUpdate"
+          >
+            <template v-if="updatePhase === 'installing'">安装中…</template>
+            <template v-else-if="updatePhase === 'downloading'">下载中… {{ updateProgress.total ? Math.round(updatePct) + '%' : '' }}</template>
+            <template v-else>立即更新</template>
           </button>
         </div>
       </div>
@@ -1457,6 +1471,8 @@ const updateInfo = ref<UpdateInfo | null>(null);
 const updateBusy = ref(false);
 const updatePhase = ref<"idle" | "downloading" | "installing">("idle");
 const updateProgress = ref({ downloaded: 0, total: 0 });
+/** 本次下载是否已被用户取消（取消后不再进入安装流程） */
+const updateDownloadCancelled = ref(false);
 /** 10 分钟提醒定时器（"暂不更新"后持续提醒，直到用户选择立即更新） */
 let updateRemindTimer: ReturnType<typeof setInterval> | null = null;
 /** 长驻会话的定期复查定时器（6 小时） */
@@ -1508,14 +1524,20 @@ function appendUpdateLog(info: UpdateInfo) {
 }
 
 /**
- * "暂不更新"：关闭弹框但**每 10 分钟再次提醒**，
- * 直到用户点击"立即更新"为止（跨重启也继续，因为待更新版本已落盘）。
+ * "暂不更新" / 关闭弹框：
+ * - 正在下载时：**视为取消下载**（中止后端下载并删除半成品），然后关闭弹框；
+ * - 安装阶段：不允许推迟（进程马上就要退出），给出提示；
+ * - 其余情况：关闭弹框，但每 10 分钟再次提醒，直到用户点击"立即更新"。
  */
-function snoozeUpdate() {
-  // 更新已经在进行中时不允许"暂不更新"：否则下载会在后台跑完并把应用重启，
-  // 而界面却显示成"已推迟"，行为会让人措手不及。
-  if (updateBusy.value) {
-    alert("更新正在进行中，无法推迟。下载完成后应用会自动退出并安装新版本。");
+async function snoozeUpdate() {
+  if (updatePhase.value === "downloading") {
+    await cancelUpdateDownload();
+    showUpdateModal.value = false;
+    store.appendLog("system", "下载中关闭弹框 → 已按「取消下载」处理（未安装任何内容）");
+    return;
+  }
+  if (updatePhase.value === "installing") {
+    alert("正在安装新版本，应用即将退出并自动完成升级，此时无法推迟。");
     return;
   }
   showUpdateModal.value = false;
@@ -1549,15 +1571,23 @@ const updatePct = computed(() => {
 /**
  * "立即更新"：下载新安装包 → 启动游离更新脚本 → 退出应用。
  * 卸载与重装由脚本在本进程退出后串行完成（运行中的 exe 无法自替换）。
+ *
+ * 下载期间用户可随时取消：点「取消下载」或关闭弹框都会中止下载
+ * 并删除半成品文件（不留 96MB 垃圾）。
  */
 async function startUpdate() {
   const info = updateInfo.value;
   if (!info?.asset) { alert("没有可用的安装包。"); return; }
+  if (updatePhase.value === "downloading") { await cancelUpdateDownload(); return; }
+  if (updatePhase.value === "installing") return;
   updateBusy.value = true;
   updatePhase.value = "downloading";
+  updateDownloadCancelled.value = false;
   updateProgress.value = { downloaded: 0, total: 0 };
   try {
     const path = await tauriAPI.downloadUpdate(info.asset.download_url, info.asset.name);
+    // 下载途中被判为取消：不再进入安装流程
+    if (updateDownloadCancelled.value) { resetUpdateDownloadState(); return; }
     updatePhase.value = "installing";
     await tauriAPI.installUpdate(path);
     localStorage.removeItem("deep-ide-pending-update");
@@ -1566,10 +1596,35 @@ async function startUpdate() {
     // 给脚本一点启动时间，然后退出应用
     setTimeout(() => { tauriAPI.quitForUpdate(); }, 800);
   } catch (e: any) {
+    const msg = String(e);
+    if (updateDownloadCancelled.value || msg.includes("下载已取消")) {
+      resetUpdateDownloadState();
+      store.appendLog("system", "已取消下载新版本（未安装任何内容）");
+      return;
+    }
     updateBusy.value = false;
     updatePhase.value = "idle";
     alert(`更新失败：${e}\n\n可稍后重试，或手动从 Gitee Releases 下载安装包。`);
   }
+}
+
+/** 重置下载态（取消后回到"可以重新开始下载"的初始状态） */
+function resetUpdateDownloadState() {
+  updateBusy.value = false;
+  updatePhase.value = "idle";
+  updateProgress.value = { downloaded: 0, total: 0 };
+  updateDownloadCancelled.value = false;
+}
+
+/**
+ * 取消下载：通知后端中止并删除半成品，前端立即复位。
+ * 若用户是在下载途中关闭弹框，也走这里 —— 「退出此页面即视为取消下载」。
+ */
+async function cancelUpdateDownload() {
+  updateDownloadCancelled.value = true;
+  try { await tauriAPI.cancelUpdate(); } catch (_) {}
+  resetUpdateDownloadState();
+  store.appendLog("system", "已取消下载新版本（半成品安装包已删除）");
 }
 
 // ─── 集成能力面板：费用统计 / 上下文引擎 / 长期记忆 / 规则引擎 / 插件体检 ───

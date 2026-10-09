@@ -116,10 +116,25 @@ pub async fn check_update(repo: &str, current: &str) -> UpdateInfo {
         info.error = Some(format!("Gitee 返回 {}", resp.status()));
         return info;
     }
-    let releases: Vec<GiteeRelease> = match resp.json().await {
+    // Gitee 的 releases 接口返回 `Content-Type: application/json`，**不带 charset**。
+    // reqwest 的 `Response::json()` 在没有 charset 时会按 Latin-1/Windows-1252 解码，
+    // 于是发布说明里的中文全变成乱码。这里必须自己按 UTF-8 解码。
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let body = match resp.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            info.error = Some(format!("读取发布列表失败: {}", e));
+            return info;
+        }
+    };
+    let releases: Vec<GiteeRelease> = match parse_releases(&body, content_type.as_deref()) {
         Ok(v) => v,
         Err(e) => {
-            info.error = Some(format!("解析发布列表失败: {}", e));
+            info.error = Some(e);
             return info;
         }
     };
@@ -146,10 +161,29 @@ pub async fn check_update(repo: &str, current: &str) -> UpdateInfo {
 
     info.latest = best.tag_name.clone();
     info.published_at = best.created_at.clone();
-    info.notes = best.body.chars().take(4000).collect();
-    if info.notes.is_empty() {
-        info.notes = best.name.clone();
-    }
+    /*
+     * 更新说明的取值顺序（v0.5.6 起）：
+     *   1. 内置说明：docs/releases/v<版本>.md 在编译期打进程序，最可靠；
+     *   2. 远端正文：仅当该版本没有内置说明、且**通过乱码校验**时才用；
+     *   3. 兜底文案：版本号 + 升级方式，绝不给用户看乱码或半截文本。
+     */
+    let remote_notes = sanitize_notes(&best.body);
+    info.notes = match crate::release_notes::builtin_notes(&best.tag_name) {
+        Some(local) => clean_builtin_notes(local),
+        None => {
+            if remote_notes.is_empty() {
+                let name = sanitize_notes(&best.name);
+                if name.is_empty() {
+                    crate::release_notes::fallback_notes(&info.latest, &info.current)
+                } else {
+                    name
+                }
+            } else {
+                remote_notes
+            }
+        }
+    };
+    info.notes = info.notes.chars().take(4000).collect();
 
     // 选安装包：优先 .exe 且名字含 setup
     let pick = best
@@ -172,6 +206,9 @@ pub async fn check_update(repo: &str, current: &str) -> UpdateInfo {
 
 /// 下载安装包到临时目录，返回本地路径。
 /// 通过 `on_progress(已下载, 总大小)` 回调上报进度。
+///
+/// **可取消**：前端点了「取消下载 / 关闭弹框」后 [cancel_download] 会置位，
+/// 这里在 200ms 内停止读取并**删除半成品文件**（不留 96MB 垃圾在临时目录）。
 pub async fn download_installer(
     url: &str,
     file_name: &str,
@@ -180,6 +217,9 @@ pub async fn download_installer(
     let dir = std::env::temp_dir().join("DeepAhead_update");
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建更新目录失败: {}", e))?;
     let dest = dir.join(file_name);
+
+    // 本次下载开始：清掉取消位
+    reset_cancel();
 
     // 清理上一次下载残留的安装包，避免每次更新都在临时目录里堆一个 100 MB 文件
     if let Ok(entries) = std::fs::read_dir(&dir) {
@@ -212,7 +252,18 @@ pub async fn download_installer(
     let mut file = std::fs::File::create(&dest).map_err(|e| format!("创建文件失败: {}", e))?;
     use std::io::Write;
     let mut downloaded: u64 = 0;
-    while let Some(chunk) = resp.chunk().await.map_err(|e| format!("读取下载流失败: {}", e))? {
+    loop {
+        // 取消位优先：用 select 保证"点了取消立刻停"，而不是等下一个数据块
+        let chunk = tokio::select! {
+            biased;
+            _ = wait_cancel() => {
+                drop(file);
+                let _ = std::fs::remove_file(&dest);
+                return Err(CANCELLED.into());
+            }
+            c = resp.chunk() => c.map_err(|e| format!("读取下载流失败: {}", e))?,
+        };
+        let Some(chunk) = chunk else { break };
         file.write_all(&chunk).map_err(|e| format!("写入失败: {}", e))?;
         downloaded += chunk.len() as u64;
         on_progress(downloaded, total);
@@ -227,9 +278,152 @@ pub async fn download_installer(
     Ok(dest)
 }
 
+/// 下载被用户取消时返回的错误串（前端据此静默复位，不弹"失败"）
+pub const CANCELLED: &str = "下载已取消";
+
+static CANCEL_FLAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 复位取消位（每次开始下载前调用）
+pub fn reset_cancel() {
+    CANCEL_FLAG.store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// 请求取消当前下载
+pub fn cancel_download() {
+    CANCEL_FLAG.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// 是否已请求取消
+pub fn is_cancelled() -> bool {
+    CANCEL_FLAG.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// 取消位一旦置位就立即返回（用于 select!）
+async fn wait_cancel() {
+    while !is_cancelled() {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
 /// VBScript 字符串字面量转义（内部的双引号要写成两个）
 fn vbs_str(s: &str) -> String {
     s.replace('"', "\"\"")
+}
+
+/// 发布列表的 JSON 解码。
+///
+/// **必须按 UTF-8 显式解码**：Gitee 返回 `Content-Type: application/json`（不带 charset），
+/// 而 `reqwest::Response::json()` 在缺 charset 时退化为 Latin-1，中文会整段变乱码。
+/// 这里只信任 `charset=` 明确声明的编码，其余一律按 UTF-8 处理。
+fn parse_releases(bytes: &[u8], content_type: Option<&str>) -> Result<Vec<GiteeRelease>, String> {
+    let declared = content_type
+        .and_then(|ct| {
+            ct.split(';')
+                .map(|p| p.trim())
+                .find(|p| p.to_lowercase().starts_with("charset="))
+                .map(|p| p[8..].trim().trim_matches('"').to_lowercase())
+        })
+        .unwrap_or_else(|| "utf-8".to_string());
+
+    let text = match declared.as_str() {
+        "utf-8" | "utf8" => String::from_utf8(bytes.to_vec())
+            .map_err(|e| format!("解析发布列表失败（响应不是合法 UTF-8）: {}", e))?,
+        // Gitee 历史上只出现过 UTF-8；其它编码声明按 UTF-8 兜底而不是拒绝
+        _ => String::from_utf8_lossy(bytes).into_owned(),
+    };
+    serde_json::from_str::<Vec<GiteeRelease>>(&text)
+        .map_err(|e| format!("解析发布列表失败: {}", e))
+}
+
+/// 清洗发布说明：去掉会撑乱弹框的不可见控制字符。
+/// **不做**乱码猜测式改写——一旦发现典型乱码就把说明交还给"版本号 + 下载按钮"，
+/// 因为把乱码"猜回来"同样是错的。
+fn sanitize_notes(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .filter(|c| *c == '\n' || *c == '\t' || !c.is_control())
+        .collect();
+    let cleaned = collapse_blank_lines(&cleaned);
+    if looks_like_mojibake(&cleaned) {
+        return String::new();
+    }
+    cleaned
+}
+
+/// 内置说明（docs/releases/v*.md）的清洗：去掉开头那行标题。
+/// 弹框顶部已经有「当前 0.5.5 → v0.5.6」的版本跃迁，正文不必再重复一遍标题。
+fn clean_builtin_notes(raw: &str) -> String {
+    let cleaned = sanitize_notes(raw);
+    let mut lines: Vec<&str> = cleaned.lines().collect();
+    while let Some(first) = lines.first() {
+        let t = first.trim();
+        if t.is_empty() || t.starts_with('#') {
+            lines.remove(0);
+        } else {
+            break;
+        }
+    }
+    // 文档里常用的 --- 分隔线在弹框里没有意义，去掉首尾的
+    while let Some(last) = lines.last() {
+        let t = last.trim();
+        if t.is_empty() || t == "---" {
+            lines.pop();
+        } else {
+            break;
+        }
+    }
+    lines.join("\n").trim().to_string()
+}
+
+/// 折叠连续空行（发布说明里常有 3 个以上空行，弹框里很难看）
+fn collapse_blank_lines(s: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    let mut blanks = 0usize;
+    for line in s.lines() {
+        if line.trim().is_empty() {
+            blanks += 1;
+            if blanks > 1 {
+                continue;
+            }
+        } else {
+            blanks = 0;
+        }
+        out.push(line.trim_end());
+    }
+    out.join("\n").trim().to_string()
+}
+
+/// 典型 UTF-8 被按单字节编码误解的"乱码字符"（如「锟斤拷」「烫烫烫」「Ã」「â」）
+const MOJIBAKE_MARKERS: [&str; 10] = [
+    "锟斤拷", "烫烫烫", "屯屯屯", "Ã", "Â", "â€", "ã€", "å", "æ", "é",
+];
+
+/// 是否明显是乱码（中英混排的正常说明不会命中）
+fn looks_like_mojibake(s: &str) -> bool {
+    if s.trim().is_empty() {
+        return false;
+    }
+    // 「锟斤拷」是 UTF-8→GBK 误解码的产物：**重复出现**才算乱码，
+    // 因为"锟斤拷"三个字本身作为正常词几乎不可能连用，但为了不误伤单个出现，
+    // 这里要求重复。
+    if s.matches("锟斤拷").count() >= 2 || s.matches("烫烫烫").count() >= 2 {
+        return true;
+    }
+    // 命中 2 类典型乱码标记即判定
+    let hits = MOJIBAKE_MARKERS.iter().filter(|m| s.contains(**m)).count();
+    if hits >= 2 {
+        return true;
+    }
+    // 或者：典型"高位拉丁字母"占比异常（真正的乱码里它们是主角）
+    let total = s.chars().count();
+    if total < 12 {
+        return false;
+    }
+    let weird = s
+        .chars()
+        .filter(|c| matches!(*c, 'Ã' | 'Â' | 'â' | 'ã' | 'å' | 'æ' | 'ç' | 'è' | 'é' | 'ð'))
+        .count();
+    weird >= 3 && weird * 6 > total
 }
 
 /// 更新/卸载辅助脚本所在目录
@@ -455,6 +649,113 @@ mod tests {
     fn parse_handles_missing_parts() {
         assert!(is_newer("v1", "0.9.9"));
         assert!(!is_newer("v1.0", "1.0.0"));
+    }
+
+    /// **回归**：Gitee 返回 `Content-Type: application/json`（不带 charset）时，
+    /// 发布说明里的中文必须原样保留 —— 曾经因为走 `Response::json()` 按 Latin-1
+    /// 解码，弹框里整段更新内容变成乱码。
+    ///
+    /// 注意：这里用普通字符串（`\n` 是 JSON 需要的转义），**不要**换成原始字符串——
+    /// 发布说明里的 `## 标题` 会提前闭合 `"##` 定界符。
+    #[test]
+    fn releases_json_without_charset_keeps_chinese() {
+        let json = "[{\"tag_name\":\"v0.5.6\",\"name\":\"DeepAhead v0.5.6\",\
+                    \"body\":\"修复\\n更新内容乱码问题，按钮样式重做\",\
+                    \"created_at\":\"2026-10-09T21:22:57+08:00\",\"assets\":[\
+                    {\"name\":\"DeepAhead_0.5.6_x64-setup.exe\",\"size\":101052529,\
+                    \"browser_download_url\":\"https://gitee.com/x/y/releases/download/v0.5.6/a.exe\"}]}]";
+        let parsed = parse_releases(json.as_bytes(), Some("application/json"))
+            .expect("不带 charset 的 application/json 也必须能解析");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].tag_name, "v0.5.6");
+        assert!(
+            parsed[0].body.contains("更新内容乱码问题"),
+            "中文必须原样保留，实际为：{}",
+            parsed[0].body
+        );
+        assert!(parsed[0].body.contains('\n'), "JSON 的 \\n 应解码为真实换行");
+        assert!(parsed[0].assets[0].name.contains("0.5.6"));
+    }
+
+    /// 显式声明 charset 时按声明处理；带 charset 的 UTF-8 同样不能坏
+    #[test]
+    fn releases_json_with_charset_also_ok() {
+        let json = "[{\"tag_name\":\"v0.5.6\",\"name\":\"n\",\"body\":\"中文说明\",\
+                    \"created_at\":\"\",\"assets\":[]}]";
+        let a = parse_releases(json.as_bytes(), Some("application/json; charset=utf-8")).unwrap();
+        assert_eq!(a[0].body, "中文说明");
+        let b = parse_releases(json.as_bytes(), None).unwrap();
+        assert_eq!(b[0].body, "中文说明");
+    }
+
+    /// 发布说明清洗：控制字符与非 UTF-8 字节不得原样进弹框
+    #[test]
+    fn notes_are_sanitized() {
+        // 控制字符被剔除，空行折叠
+        let cleaned = sanitize_notes("标题\u{0}\u{7}\n\n\n\n正文\u{1b}[31m");
+        assert!(!cleaned.contains('\u{0}') && !cleaned.contains('\u{1b}'));
+        assert!(!cleaned.contains("\n\n\n"), "连续空行应被折叠: {:?}", cleaned);
+        assert!(cleaned.contains("正文"));
+
+        // 典型乱码 → 直接置空（宁可少显示，也不显示乱码）
+        assert_eq!(sanitize_notes("æ´æ°åå®¹ä¹±ç Ã©Ã¥"), "");
+        assert_eq!(sanitize_notes("锟斤拷锟斤拷锟斤拷"), "");
+
+        // 正常中英混排不受影响
+        let normal = "## DeepAhead v0.5.6\n修复 Gitee 中文乱码 + 按钮样式（96 MB）";
+        assert_eq!(sanitize_notes(normal), normal);
+    }
+
+    /// 下载取消位：置位后可被读到，复位后清除
+    #[test]
+    fn cancel_flag_roundtrip() {
+        reset_cancel();
+        assert!(!is_cancelled());
+        cancel_download();
+        assert!(is_cancelled());
+        reset_cancel();
+        assert!(!is_cancelled());
+    }
+
+    /// 临时诊断：打印内置说明清洗后的实际展示内容（发布前肉眼确认）。
+    /// 运行：`cargo test --lib -- --ignored live_gitee_notes --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn live_gitee_notes_have_no_mojibake() {
+        let info = check_update(DEFAULT_REPO, "0.0.1").await;
+        println!("---- latest={} error={:?} ----", info.latest, info.error);
+        println!("---- notes ({} chars) ----", info.notes.chars().count());
+        println!("{}", info.notes);
+        println!("---- end ----");
+        assert!(info.error.is_none(), "检查更新报错：{:?}", info.error);
+        assert!(
+            !looks_like_mojibake(&info.notes),
+            "更新说明仍是乱码：{}",
+            info.notes
+        );
+    }
+
+    /// 内置发布说明：弹框里的"更新内容"始终可用（不依赖 Gitee 正文健康度）
+    #[test]
+    fn builtin_notes_exist_and_are_clean() {
+        // 每个已发布的版本都应该有内置说明（docs/releases/v*.md）
+        for v in ["0.5.4", "0.5.5", "v0.4.1"] {
+            let notes = crate::release_notes::builtin_notes(v);
+            assert!(notes.is_some(), "版本 {} 应有内置发布说明", v);
+            let cleaned = clean_builtin_notes(notes.unwrap());
+            assert!(!cleaned.is_empty(), "{} 的说明清洗后不应为空", v);
+            assert!(!cleaned.starts_with('#'), "标题行应被去掉: {}", cleaned);
+            assert!(!looks_like_mojibake(&cleaned), "内置说明不应判定为乱码");
+        }
+        assert!(crate::release_notes::builtin_notes("9.9.9").is_none());
+    }
+
+    /// 兜底文案：远端与内置都缺时，至少给出可读的版本信息
+    #[test]
+    fn fallback_notes_are_usable() {
+        let f = crate::release_notes::fallback_notes("v0.5.6", "0.5.5");
+        assert!(f.contains("v0.5.6") && f.contains("0.5.5"));
+        assert!(!looks_like_mojibake(&f));
     }
 
     /// 真实网络测试：验证 Rust 侧的 Gitee 检测链路确实能跑通

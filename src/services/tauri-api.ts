@@ -272,6 +272,8 @@ export const tauriAPI = {
   /** 下载安装包（进度通过 `update-download-progress` 事件上报） */
   downloadUpdate: (url: string, fileName: string) =>
     invoke<string>("download_update", { url, fileName }),
+  /** 取消正在进行的下载（关闭更新弹框/点「取消下载」时调用；后端会删除半成品） */
+  cancelUpdate: () => invoke<boolean>("cancel_update"),
   /** 启动更新：写游离脚本 → 本进程退出后静默卸载旧版并安装新版 */
   installUpdate: (installerPath: string) => invoke<string>("install_update", { installerPath }),
   /** 一键静默卸载（无窗口）：本进程退出后静默运行卸载器 */

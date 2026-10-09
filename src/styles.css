@@ -708,7 +708,10 @@ body {
 .update-modal .modal-box {
     width: 580px; max-width: 94vw; overflow: hidden;
     border-radius: 14px; box-shadow: 0 20px 60px rgba(15, 30, 60, 0.22);
+    /* 限高 + 纵向布局：更新说明超长时在内部滚动，底部按钮永远可见 */
+    display: flex; flex-direction: column; max-height: 88vh;
 }
+.update-modal .modal-box > .update-body { flex: 1; min-height: 0; overflow-y: auto; }
 
 /* 顶部渐变 hero：把"有新版本"这件事一眼讲清 */
 .update-hero {
@@ -799,21 +802,41 @@ body {
 .update-notes { margin-top: 0.75rem; }
 .update-notes-title { font-size: 0.76rem; color: #4e5969; font-weight: 600; margin-bottom: 0.3rem; }
 .update-notes-body {
-    margin: 0; padding: 0.6rem 0.7rem; background: #f8f9fb; border: 1px solid #e8ebef;
-    border-radius: 8px; font-size: 0.72rem; line-height: 1.6; color: #444;
-    white-space: pre-wrap; overflow-wrap: anywhere; max-height: 220px; overflow-y: auto;
+    margin: 0; padding: 0.6rem 0.75rem; background: #f8f9fb; border: 1px solid #e8ebef;
+    border-radius: 10px; font-size: 0.73rem; line-height: 1.72; color: #414a55;
+    white-space: pre-wrap; overflow-wrap: anywhere;
+    max-height: 240px; overflow-y: auto;
 }
+/* 弹框限高与滚动由 .update-modal .modal-box 统一处理（见上） */
 .update-hint {
     margin-top: 0.7rem; padding: 0.45rem 0.6rem; background: #f6f9fc;
     border: 1px solid #e2ecf5; border-radius: 8px;
     font-size: 0.72rem; line-height: 1.6; color: #55606b;
 }
 
-/* 底部按钮区 */
+/* 底部按钮区：两个按钮等宽、等高、居中文字（此前用 .btn 的 padding 撑成了怪形状） */
 .update-actions {
-    display: flex; gap: 0.6rem; justify-content: flex-end;
-    padding: 0.9rem 1.2rem 1.1rem; border-top: 1px solid #f0f2f5; background: #fcfdfe;
+    display: flex; gap: 0.6rem; justify-content: flex-end; align-items: stretch;
+    padding: 0.85rem 1.2rem 1.05rem; border-top: 1px solid #f0f2f5; background: #fcfdfe;
 }
+.update-btn {
+    min-width: 116px; height: 38px; padding: 0 1.1rem;
+    display: inline-flex; align-items: center; justify-content: center;
+    border-radius: 9px; border: 1px solid transparent;
+    font-size: 0.84rem; font-weight: 600; font-family: inherit; line-height: 1;
+    cursor: pointer; transition: all 0.16s ease; white-space: nowrap;
+}
+.update-btn.ghost {
+    background: #fff; border-color: #dfe3e8; color: #5b6470;
+}
+.update-btn.ghost:hover:not(:disabled) { border-color: #b9c0c9; color: #333; background: #fafbfc; }
+.update-btn.primary {
+    background: linear-gradient(180deg, #2f80ed, #1a73e8); color: #fff;
+    box-shadow: 0 2px 10px rgba(26, 115, 232, 0.28);
+}
+.update-btn.primary:hover:not(:disabled) { background: linear-gradient(180deg, #1a73e8, #155fc4); }
+.update-btn:disabled { opacity: 0.55; cursor: not-allowed; box-shadow: none; }
+.update-btn:focus-visible { outline: 2px solid rgba(26, 115, 232, 0.45); outline-offset: 1px; }
 .update-actions .btn { min-width: 108px; }
 .update-go { box-shadow: 0 2px 10px rgba(26,115,232,0.28); }
 .agent-tool-header {
