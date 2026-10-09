@@ -64,6 +64,22 @@ export interface SafetyResult { rule_id: string; message: string; action: "confi
 export interface VisionConfigInfo { provider: string; api_key: string; base_url: string; model: string; configured: boolean; }
 export interface VisionResult { text: string; provider: string; image_path: string; }
 
+// ─── 自动更新 ───
+export interface UpdateAsset {
+  name: string;
+  size: number;
+  download_url: string;
+}
+export interface UpdateInfo {
+  current: string;
+  latest: string;
+  has_update: boolean;
+  notes: string;
+  published_at: string;
+  asset: UpdateAsset | null;
+  error: string | null;
+}
+
 // ─── 上下文占用 + 压缩 ───
 export interface ContextUsage { tokens: number; limit: number; ratio: number; }
 /** 长期记忆配置（dsh-memory-protocol 移植） */
@@ -203,6 +219,19 @@ export const tauriAPI = {
   runCommand: (path: string, command: string) => invoke<string>("run_command", { path, command }),
   runFile: (path: string, runtime?: string) => invoke<string>("run_file", { path, runtime: runtime || null }),
   detectRuntimes: () => invoke<{name:string;version:string|null;available:boolean;path:string|null}[]>("detect_runtimes_enhanced"),
+
+  // ─── 自动更新（检测 Gitee 新版本 → 下载 → 卸载重装）───
+  appVersion: () => invoke<string>("app_version"),
+  /** 检查 Gitee 上是否有新版本（公开仓库，无需凭据） */
+  checkUpdate: (repo?: string, current?: string) =>
+    invoke<UpdateInfo>("check_update", { repo: repo ?? null, current: current ?? null }),
+  /** 下载安装包（进度通过 `update-download-progress` 事件上报） */
+  downloadUpdate: (url: string, fileName: string) =>
+    invoke<string>("download_update", { url, fileName }),
+  /** 启动更新：写游离脚本 → 本进程退出后静默卸载旧版并安装新版 */
+  installUpdate: (installerPath: string) => invoke<string>("install_update", { installerPath }),
+  /** 立即退出应用（"立即更新"在启动辅助脚本后调用） */
+  quitForUpdate: () => invoke<void>("quit_for_update"),
 
   // ─── 上下文占用比例 + 压缩 ───
   estimateContextUsage: (systemPrompt: string, messages: Message[], contextPaths: string[] = []) =>

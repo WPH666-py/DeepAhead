@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 pub mod commands;
 pub mod ai;
 pub mod cli;
+pub mod update;
 
 pub use ai::{ApprovalGate, ApprovalMode, DeepSeekClient, UndoStore};
 

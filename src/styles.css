@@ -703,6 +703,36 @@ body {
     padding: 0.3rem 0.6rem; font-size: 0.66rem; color: #a8afb8;
     background: #f8f9fb; border-top: 1px solid #f2f4f6;
 }
+
+/* ========== 自动更新弹框 ========== */
+.update-modal .modal-box { width: 560px; }
+.update-versions {
+    display: flex; align-items: baseline; gap: 0.6rem; margin-bottom: 0.6rem;
+    font-size: 0.9rem;
+}
+.update-cur { color: #8a919f; font-family: 'Cascadia Code','Consolas',monospace; }
+.update-arrow { color: #b8bfc6; }
+.update-new {
+    color: #067647; font-weight: 700;
+    font-family: 'Cascadia Code','Consolas',monospace; font-size: 1.05rem;
+}
+.update-asset { font-size: 0.78rem; color: #4e5969; margin-bottom: 0.2rem; }
+.update-asset code { font-family: 'Cascadia Code','Consolas',monospace; }
+.update-date { font-size: 0.72rem; color: #a8afb8; margin-bottom: 0.6rem; }
+.update-progress { margin: 0.6rem 0; }
+.update-progress-label { font-size: 0.76rem; color: #4e5969; margin-bottom: 0.3rem; }
+.update-notes { margin-top: 0.6rem; }
+.update-notes-title { font-size: 0.76rem; color: #8a919f; margin-bottom: 0.25rem; }
+.update-notes-body {
+    margin: 0; padding: 0.55rem 0.65rem; background: #f7f8fa; border: 1px solid #e6e9ec;
+    border-radius: 6px; font-size: 0.72rem; line-height: 1.55; color: #444;
+    white-space: pre-wrap; overflow-wrap: anywhere; max-height: 220px; overflow-y: auto;
+}
+.update-hint {
+    margin-top: 0.7rem; padding: 0.45rem 0.6rem; background: #f6f9fc;
+    border: 1px solid #e2ecf5; border-radius: 6px;
+    font-size: 0.72rem; line-height: 1.6; color: #55606b;
+}
 .agent-tool-header {
     display: flex; align-items: center; gap: 6px; cursor: pointer;
     padding: 3px 6px; border-radius: 3px; flex-wrap: nowrap;

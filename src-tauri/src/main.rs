@@ -118,6 +118,12 @@ fn main() {
             // CLI 桥接
             cli::check_deepseek_cli,
             cli::run_cli_agent_task,
+            // 自动更新（检测 Gitee 新版本 → 下载 → 卸载重装）
+            commands::app_version,
+            commands::check_update,
+            commands::download_update,
+            commands::install_update,
+            commands::quit_for_update,
         ])
         .run(tauri::generate_context!())
         .expect("error while running DeepAhead");

@@ -527,6 +527,10 @@ pub struct RuleEngineState {
     pub has_execute_clause: bool,
     /// 本会话已发过纠正的规则
     pub injected_rules: HashSet<String>,
+    /// 任务契约（/guard mode|budget|contract 操作它）
+    pub contract: TaskContract,
+    /// 质量账本趋势窗口
+    pub quality_window: usize,
 }
 
 /// 判断是否受保护配置路径
@@ -1304,6 +1308,12 @@ pub const GUARD_USAGE: &str = "\
   reload            重新解析 AGENTS.md
   label <ERR-码|指纹> <correct|incorrect>
   label clear <指纹> 撤销指纹放行
+  mode <observe|review|answer|change|monitor|watch|off>   任务契约模式
+  budget [N]        查看/设置委派预算
+  contract [arm|disarm|hash|deps|path|categories|clear]   任务契约细项
+  quality           质量账本趋势
+  approve <类型> <路径> [分钟]   签发一条授权（不允许 any）
+  hotword [词]      查看/学习热词
   freedom           盲区自述（当前未实现的能力）
 ";
 
@@ -1518,16 +1528,190 @@ pub fn run_guard_command(cfg: &mut RuleEngineConfig, state: &mut RuleEngineState
   ✓ 只读命令判定（引用感知分段，2>&1 不误判）
   ✓ 硬门：旁路 / 自保护 / 内联命令禁令 / 重试熔断 / 意图直判 / 授权边界
   ✓ 回合裁决卡片 + 判例一次性登记 + 指纹学习放行（危险命令永不指纹化）
+  ✓ 文本审计与纠正注入（12 项检测 + 交付门：每规则一次、每小时 ≤3）
+  ✓ 任务契约（modes / levels / hash 与依赖策略 / 路径与类别约束 / 委派预算）
+  ✓ 质量账本（任务签名归一化 + 趋势）
+  ✓ 热词学习（长度受限、上限 500、原子写）
   ✓ 审计账本 JSONL（2MB 轮转）
 
 未实现（诚实清单）：
-  ✗ LLM 意图兜底（上游的「非对称救援」需要 LLM 路由）
-  ✗ 文本注入纠正通道（助手文本审计：交付声明/时间证据/批评冻结等 20 项）
-  ✗ 任务契约与反过度设计（modes/budgets/hash 策略）
-  ✗ 质量账本、热词学习、技能授权实时对账
-  ✗ /guard 的 approve / mode / budget / contract / quality 子命令
+  ✗ LLM 意图兜底（裁决器需要 LLM 路由；DeepAhead 未接入异步裁决）
+  ✗ 技能授权实时对账（DeepAhead 无技能目录注册表）
+  ✗ 挂载/装配完整性审计（依赖宿主插件加载器）
+  ✗ 版本守卫回滚（依赖工具调用/结果的成对钩子）
 ";
             ok(s.into())
+        }
+        // ─── 任务契约 ───
+        "mode" => {
+            let m = parts.get(1).copied().unwrap_or("");
+            const MODES: [&str; 7] = ["observe", "review", "answer", "change", "monitor", "watch", "off"];
+            if !MODES.contains(&m) {
+                return err(format!("用法：/guard mode <{}>", MODES.join("|")));
+            }
+            state.contract.mode = m.to_string();
+            match m {
+                "off" => state.contract.armed = false,
+                "change" => {
+                    state.contract.armed = true;
+                    state.contract.level = "guard".into();
+                }
+                _ => {}
+            }
+            audit("guard-command", "__contract", "mode", m, "");
+            ok(format!(
+                "任务契约模式 → {}（armed={}，等级 {}）",
+                m, state.contract.armed, state.contract.level
+            ))
+        }
+        "budget" => {
+            let n = parts.get(1).copied().unwrap_or("");
+            if n.is_empty() {
+                return ok(format!(
+                    "委派预算：{}/{}（0 表示不限制；armed 且为 0 时按 2 处理）",
+                    state.contract.agent_spent, state.contract.agent_budget
+                ));
+            }
+            let v: u32 = match n.parse() {
+                Ok(v) => v,
+                Err(_) => return err("用法：/guard budget <次数>".into()),
+            };
+            state.contract.agent_budget = v;
+            state.contract.agent_spent = 0;
+            audit("guard-command", "__contract", "budget", &format!("设为 {}", v), "");
+            ok(format!("委派预算设为 {}（已重置用量）", v))
+        }
+        "contract" => {
+            let sub2 = parts.get(1).copied().unwrap_or("");
+            match sub2 {
+                "" => {
+                    let c = &state.contract;
+                    ok(format!(
+                        "任务契约：\n  模式 {} ｜ 等级 {} ｜ armed {}\n  委派预算 {}/{}\n  哈希策略 {} ｜ 依赖策略 {}\n  允许路径 {:?}\n  允许类别 {:?}\n（破坏性类别 {} 结构性不可授权）",
+                        c.mode, c.level, c.armed, c.agent_spent, c.agent_budget,
+                        c.hash_policy, c.dependency_policy, c.allowed_paths, c.categories,
+                        DESTRUCTIVE_CATEGORIES.join("/")
+                    ))
+                }
+                "arm" => {
+                    state.contract.armed = true;
+                    if state.contract.level == "off" {
+                        state.contract.level = "guard".into();
+                    }
+                    audit("guard-command", "__contract", "arm", "", "");
+                    ok("任务契约已启用（armed）".into())
+                }
+                "disarm" => {
+                    state.contract.armed = false;
+                    audit("guard-command", "__contract", "disarm", "", "");
+                    ok("任务契约已停用".into())
+                }
+                "hash" | "deps" => {
+                    let v = parts.get(2).copied().unwrap_or("");
+                    if !["deny", "ask", "allow"].contains(&v) {
+                        return err(format!("用法：/guard contract {} <deny|ask|allow>", sub2));
+                    }
+                    if sub2 == "hash" {
+                        state.contract.hash_policy = v.to_string();
+                    } else {
+                        state.contract.dependency_policy = v.to_string();
+                    }
+                    audit("guard-command", "__contract", sub2, v, "");
+                    ok(format!("{} 策略 → {}", if sub2 == "hash" { "哈希" } else { "依赖" }, v))
+                }
+                "path" => {
+                    let v = parts.get(2).copied().unwrap_or("");
+                    if v.is_empty() {
+                        return err("用法：/guard contract path <路径前缀>".into());
+                    }
+                    state.contract.allowed_paths.push(v.to_string());
+                    audit("guard-command", "__contract", "path", v, "");
+                    ok(format!("已追加允许路径：{}", v))
+                }
+                "categories" => {
+                    let v = parts.get(2).copied().unwrap_or("");
+                    if v.is_empty() {
+                        return err("用法：/guard contract categories <a,b,c>".into());
+                    }
+                    state.contract.categories = v
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    audit("guard-command", "__contract", "categories", v, "");
+                    ok(format!(
+                        "允许类别 → {:?}（破坏性类别 {} 会被契约拒绝）",
+                        state.contract.categories,
+                        DESTRUCTIVE_CATEGORIES.join("/")
+                    ))
+                }
+                "clear" => {
+                    state.contract = TaskContract::default();
+                    audit("guard-command", "__contract", "clear", "", "");
+                    ok("任务契约已重置为默认（未启用）".into())
+                }
+                other => err(format!(
+                    "未知：/guard contract {}\n用法：arm|disarm|hash|deps|path|categories|clear",
+                    other
+                )),
+            }
+        }
+        // ─── 质量账本 ───
+        "quality" => {
+            let rows = load_quality_ledger();
+            if rows.is_empty() {
+                return ok(format!(
+                    "质量账本为空（{}）。",
+                    quality_ledger_path().to_string_lossy()
+                ));
+            }
+            let mut s = format!("质量账本：{} 条记录\n任务签名趋势（前 → 后，越低越好）：\n", rows.len());
+            for (sig, prev, recent, n) in quality_trend(state.quality_window) {
+                let arrow = if recent < prev { "↓" } else if recent > prev { "↑" } else { "→" };
+                s.push_str(&format!("  {} {} {:.2} → {:.2}（{} 次）\n", sig, arrow, prev, recent, n));
+            }
+            ok(s)
+        }
+        // ─── 授权（approve）───
+        "approve" => {
+            let ty = parts.get(1).copied().unwrap_or("");
+            let path = parts.get(2).copied().unwrap_or("");
+            if ty.is_empty() || ty == "any" {
+                return err(
+                    "用法：/guard approve <delete|write|backup|git|command|skill> <路径> [分钟]（不允许 any 通配）"
+                        .into(),
+                );
+            }
+            let mins: i64 = parts.get(3).and_then(|v| v.parse().ok()).unwrap_or(10);
+            let mins = mins.clamp(1, 720);
+            state.authorizations.push(Authorization {
+                at: now,
+                expires_at: now + mins * 60,
+                r#type: ty.to_string(),
+                path_prefix: path.to_string(),
+                source: "physical-confirm".into(),
+            });
+            audit("guard-command", "12A", "approve", &format!("{} {} {} 分钟", ty, path, mins), "");
+            ok(format!("已授权：{} 操作，路径 {}，有效期 {} 分钟", ty, path, mins))
+        }
+        // ─── 热词 ───
+        "hotword" => {
+            let w = parts.get(1).copied().unwrap_or("");
+            if w.is_empty() {
+                let hw = load_hotwords();
+                return ok(format!(
+                    "已学习热词 {} 个（上限 {}，长度 {}-{}）：\n{}",
+                    hw.words.len(),
+                    HOTWORD_CAP,
+                    HOTWORD_MIN_LEN,
+                    HOTWORD_MAX_LEN,
+                    if hw.words.is_empty() { "（空）".to_string() } else { hw.words.join(", ") }
+                ));
+            }
+            match learn_hotword(w) {
+                Ok(hw) => ok(format!("已学习热词「{}」，当前共 {} 个", w, hw.words.len())),
+                Err(e) => err(e),
+            }
         }
         "help" | "?" | "" => ok(GUARD_USAGE.into()),
         other => err(format!("未知子命令：{}\n\n{}", other, GUARD_USAGE)),
@@ -1560,6 +1744,668 @@ pub fn make_card_block(
         label: String::new(),
         labeled_at: 0,
     }
+}
+
+// ════════════════════════════════════════════════════════
+// ① 文本审计 + 纠正注入（移植自 dsh-rule-engine text-detect / semantic）
+//
+// 上游的边界必须保留：**助手输出无法被阻断**，文本审计只做"审计 + 注入纠正"。
+// 交付门（delivery gate）：每个 (会话, 规则) 只注入一次；每会话每小时 ≤3 次；
+// 文本若长得像命令则拒绝注入。
+// ════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TextHit {
+    pub rule_id: String,
+    pub title: String,
+    /// 命中的片段（≤120 字符）
+    pub evidence: String,
+    /// correct = 词典直判，立即投递；self_certify = 疑似，需 LLM 裁决
+    pub kind: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TextAuditState {
+    /// 已注入过的规则（(会话, 规则) 只注入一次）
+    pub injected_rules: HashSet<String>,
+    /// 注入时间戳，用于"每会话每小时 ≤3 次"预算
+    pub inject_at: Vec<i64>,
+    /// 本会话建议类表达次数（规则 16）
+    pub suggestion_count: u32,
+    /// 本轮是否调用过 get-date 类工具（规则 2）
+    pub get_date_seen: bool,
+    /// 本轮只读工具调用次数（规则 31）
+    pub readonly_calls: u32,
+    /// 本轮是否出现过验证动作（规则 23）
+    pub verify_seen: bool,
+}
+
+pub const MAX_INJECT_PER_HOUR: usize = 3;
+
+const PROMISE_WORDS: [&str; 16] = [
+    "一定", "保证", "绝对", "肯定没问题", "万无一失", "包你", "必然",
+    "definitely", "guaranteed", "i promise", "for sure", "certainly will",
+    "100%", "完美解决", "彻底解决", "绝不",
+];
+const EMPTY_TALK: [&str; 12] = [
+    "got it", "好的", "收到", "明白了", "了解了", "没问题",
+    "understood", "noted", "sure thing", "will do", "okay", "ok",
+];
+const DELIVERY_CLAIM: [&str; 18] = [
+    "已完成", "已修复", "已实现", "已添加", "已更新", "已发布", "搞定", "做好了",
+    "解决了", "修好了", "改好了", "处理完了",
+    "done", "completed", "fixed", "implemented", "finished", "shipped",
+];
+const VERIFY_EVIDENCE: [&str; 14] = [
+    "测试通过", "已验证", "跑通", "编译通过", "构建成功", "cargo test", "npm test",
+    "pnpm test", "通过测试", "verified", "tests pass", "build succeeded", "assert", "check passed",
+];
+const SOURCE_MARK: [&str; 10] = [
+    "来源", "参考", "见 ", "依据", "文档", "source", "参考链接", "http", "https", "根据",
+];
+const TIME_WORDS: [&str; 10] = [
+    "今天", "现在", "目前", "当前", "刚刚", "本日", "today", "now", "currently", "right now",
+];
+const APOLOGY_ONLY: [&str; 8] = [
+    "抱歉", "对不起", "不好意思", "很遗憾", "sorry", "apologies", "my bad", "i apologize",
+];
+const APOLOGY_WITH_CAUSE: [&str; 8] = [
+    "原因", "因为", "由于", "根因", "修正", "改进", "避免", "because",
+];
+
+/// 审计助手文本，返回命中项（对齐上游 detectViolations 的主要检测器）
+pub fn text_audit(assistant_text: &str, user_text: &str, st: &mut TextAuditState) -> Vec<TextHit> {
+    let text = assistant_text;
+    let lower = text.to_lowercase();
+    let mut hits: Vec<TextHit> = Vec::new();
+    let ev = |needle: &str| -> String {
+        text.lines()
+            .find(|l| l.to_lowercase().contains(&needle.to_lowercase()))
+            .unwrap_or("")
+            .trim()
+            .chars()
+            .take(120)
+            .collect()
+    };
+
+    // 规则 7：承诺/大话
+    for w in PROMISE_WORDS {
+        if lower.contains(&w.to_lowercase()) {
+            hits.push(TextHit {
+                rule_id: "7".into(),
+                title: "承诺性表达（无证据的大话）".into(),
+                evidence: ev(w),
+                kind: "correct".into(),
+            });
+            break;
+        }
+    }
+
+    // 规则 23：交付声明缺验证证据
+    let has_claim = DELIVERY_CLAIM.iter().any(|w| lower.contains(&w.to_lowercase()));
+    let has_verify = VERIFY_EVIDENCE.iter().any(|w| lower.contains(&w.to_lowercase())) || st.verify_seen;
+    if has_claim && !has_verify {
+        hits.push(TextHit {
+            rule_id: "23".into(),
+            title: "声称已完成但没有验证证据".into(),
+            evidence: DELIVERY_CLAIM
+                .iter()
+                .find(|w| lower.contains(&w.to_lowercase()))
+                .map(|w| ev(w))
+                .unwrap_or_default(),
+            kind: "correct".into(),
+        });
+    }
+
+    // 规则 2：时间表达但未取时间
+    if !st.get_date_seen {
+        for w in TIME_WORDS {
+            if lower.contains(&w.to_lowercase()) {
+                hits.push(TextHit {
+                    rule_id: "2".into(),
+                    title: "使用当前时间词但没有取时间证据".into(),
+                    evidence: ev(w),
+                    kind: "self_certify".into(),
+                });
+                break;
+            }
+        }
+    }
+
+    // 规则 5：URL/内部引用缺来源标注
+    let has_url = text.contains("http://") || text.contains("https://");
+    let has_source = SOURCE_MARK.iter().any(|w| lower.contains(&w.to_lowercase()));
+    if has_url && !has_source {
+        hits.push(TextHit {
+            rule_id: "5".into(),
+            title: "引用链接但没有标注来源".into(),
+            evidence: "（含 URL，未见来源标注）".into(),
+            kind: "self_certify".into(),
+        });
+    }
+
+    // 规则 14：散文里用路径缩写
+    for pat in ["~/.dsh", "%USERPROFILE%", "reports\\", "…\\"] {
+        if text.contains(pat) {
+            hits.push(TextHit {
+                rule_id: "14".into(),
+                title: "正文中使用路径缩写（应给完整路径）".into(),
+                evidence: ev(pat),
+                kind: "self_certify".into(),
+            });
+            break;
+        }
+    }
+
+    // 规则 22：空洞回应
+    let trimmed = lower.trim().trim_end_matches(['。', '.', '!', '！', '~']);
+    if EMPTY_TALK.iter().any(|w| trimmed == w.to_lowercase()) {
+        hits.push(TextHit {
+            rule_id: "22".into(),
+            title: "空洞回应（没有实质内容）".into(),
+            evidence: ev(&trimmed.chars().take(20).collect::<String>()),
+            kind: "correct".into(),
+        });
+    }
+
+    // 规则 22：只道歉不给原因/改进
+    let has_apology = APOLOGY_ONLY.iter().any(|w| lower.contains(&w.to_lowercase()));
+    let has_cause = APOLOGY_WITH_CAUSE.iter().any(|w| lower.contains(&w.to_lowercase()));
+    if has_apology && !has_cause {
+        hits.push(TextHit {
+            rule_id: "22".into(),
+            title: "只道歉未说明原因与改进".into(),
+            evidence: APOLOGY_ONLY
+                .iter()
+                .find(|w| lower.contains(&w.to_lowercase()))
+                .map(|w| ev(w))
+                .unwrap_or_default(),
+            kind: "correct".into(),
+        });
+    }
+
+    // 规则 16：本会话第 3 次建议类表达
+    if lower.contains("建议") || lower.contains("suggest") || lower.contains("recommend") {
+        st.suggestion_count += 1;
+        if st.suggestion_count >= 3 {
+            hits.push(TextHit {
+                rule_id: "16".into(),
+                title: "同一会话第 3 次给建议（应直接执行）".into(),
+                evidence: "（建议类表达第 3 次）".into(),
+                kind: "self_certify".into(),
+            });
+        }
+    }
+
+    // 规则 31：同一轮只读工具 ≥3 次且无验证意图
+    if st.readonly_calls >= 3 && !st.verify_seen {
+        hits.push(TextHit {
+            rule_id: "31".into(),
+            title: "重复只读调用 ≥3 次且没有验证意图".into(),
+            evidence: format!("（本轮只读调用 {} 次）", st.readonly_calls),
+            kind: "self_certify".into(),
+        });
+    }
+
+    // 规则 11：用户中文、回复全英文
+    let user_is_cjk = user_text.chars().any(is_cjk_char);
+    let reply_cjk = text.chars().filter(|c| is_cjk_char(*c)).count();
+    let reply_total = text.chars().filter(|c| !c.is_whitespace()).count().max(1);
+    if user_is_cjk && reply_cjk * 20 < reply_total && reply_total > 40 {
+        hits.push(TextHit {
+            rule_id: "11".into(),
+            title: "用户使用中文但回复以英文为主".into(),
+            evidence: "（回复中文字符占比 < 5%）".into(),
+            kind: "self_certify".into(),
+        });
+    }
+
+    hits
+}
+
+fn is_cjk_char(c: char) -> bool {
+    matches!(c as u32, 0x4E00..=0x9FFF | 0x3400..=0x4DBF | 0x3040..=0x30FF)
+}
+
+/// 投递门：是否允许把纠正文本注入到会话里。
+/// 三条闸门与上游一致：真实用户轮、每 (会话,规则) 一次、每小时 ≤3 次、
+/// 且注入文本不得"看起来像命令"。
+pub fn should_deliver_injection(
+    st: &mut TextAuditState,
+    hits: &[TextHit],
+    now: i64,
+) -> (bool, Vec<TextHit>) {
+    if hits.is_empty() {
+        return (false, vec![]);
+    }
+    // 清理 1 小时前的记录
+    st.inject_at.retain(|t| now - *t < 3600);
+    if st.inject_at.len() >= MAX_INJECT_PER_HOUR {
+        return (false, vec![]);
+    }
+    let fresh: Vec<TextHit> = hits
+        .iter()
+        .filter(|h| !st.injected_rules.contains(&h.rule_id))
+        .cloned()
+        .collect();
+    if fresh.is_empty() {
+        return (false, vec![]);
+    }
+    // 注入文本不得像命令
+    let looks_like_command = fresh
+        .iter()
+        .any(|h| h.title.contains("rm ") || h.title.contains("pwsh") || h.title.contains("node -e"));
+    if looks_like_command {
+        return (false, vec![]);
+    }
+    for h in &fresh {
+        st.injected_rules.insert(h.rule_id.clone());
+    }
+    st.inject_at.push(now);
+    (true, fresh)
+}
+
+/// 渲染纠正注入文本（对齐上游 `[规则引擎] …（规则 N，…）` 形状）
+pub fn render_injection(hits: &[TextHit]) -> String {
+    if hits.is_empty() {
+        return String::new();
+    }
+    if hits.len() == 1 {
+        let h = &hits[0];
+        return format!(
+            "[规则引擎] {}（规则 {}，已记入 /guard log；下次回复请自证/纠正）",
+            h.title, h.rule_id
+        );
+    }
+    let list = hits
+        .iter()
+        .map(|h| format!("规则 {}：{}", h.rule_id, h.title))
+        .collect::<Vec<_>>()
+        .join("；");
+    format!(
+        "[规则引擎] 本轮检出 {} 项：{}（已记入 /guard log；下次回复请自证/纠正）",
+        hits.len(),
+        list
+    )
+}
+
+// ════════════════════════════════════════════════════════
+// ② 任务契约 + 反过度设计（移植自 dsh-rule-engine contract.js）
+// ════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskContract {
+    /// review | answer | change | monitor | watch | off
+    pub mode: String,
+    /// watch | guard | lock | off
+    pub level: String,
+    /// 委派预算（0 = 不限制；armed 且为 0 时按 2 处理）
+    pub agent_budget: u32,
+    pub agent_spent: u32,
+    /// deny | ask | allow
+    pub hash_policy: String,
+    /// deny | ask | allow
+    pub dependency_policy: String,
+    /// 允许写入的路径前缀（空 = 不限制）
+    pub allowed_paths: Vec<String>,
+    /// 允许的命令类别（空 = 门未启用）
+    pub categories: Vec<String>,
+    pub armed: bool,
+}
+
+impl Default for TaskContract {
+    fn default() -> Self {
+        Self {
+            mode: "observe".into(),
+            level: "off".into(),
+            agent_budget: 0,
+            agent_spent: 0,
+            hash_policy: "deny".into(),
+            dependency_policy: "ask".into(),
+            allowed_paths: vec![],
+            categories: vec![],
+            armed: false,
+        }
+    }
+}
+
+/// 结构性不可加入 allow 列表的破坏性类别
+pub const DESTRUCTIVE_CATEGORIES: [&str; 4] = ["delete", "move", "replace", "purge"];
+/// 非破坏性类别
+pub const NON_DESTRUCTIVE_CATEGORIES: [&str; 8] = [
+    "install", "build", "test", "audit", "analyze", "naming", "sync", "restore",
+];
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContractDecision {
+    pub allow: bool,
+    pub reason_code: String,
+    pub message: String,
+}
+
+/// 从命令文本推断动作类别
+pub fn classify_action(tool: &str, command: &str) -> String {
+    let c = command.to_lowercase();
+    if c.contains("rm ") || c.contains("remove-item") || c.contains("del ") || c.contains("rmdir") {
+        return "delete".into();
+    }
+    if c.contains("move-item") || c.contains("mv ") {
+        return "move".into();
+    }
+    if c.contains("npm install") || c.contains("pnpm add") || c.contains("pip install") || c.contains("cargo add") {
+        return "install".into();
+    }
+    if c.contains("build") || c.contains("cargo build") || c.contains("pnpm build") {
+        return "build".into();
+    }
+    if c.contains("test") {
+        return "test".into();
+    }
+    match tool {
+        "write" | "edit" | "batch_write" | "batch_edit" | "str_replace_editor" => "write".into(),
+        "subagent" | "subagent_fork" | "workflow" => "delegate".into(),
+        _ => "unknown".into(),
+    }
+}
+
+/// 任务契约决策（对齐上游 decideContractAction 的 reason code 体系）
+pub fn decide_contract_action(
+    contract: &mut TaskContract,
+    tool: &str,
+    args: &serde_json::Value,
+) -> ContractDecision {
+    let allow = |code: &str, msg: &str| ContractDecision {
+        allow: true,
+        reason_code: code.into(),
+        message: msg.into(),
+    };
+    let deny = |code: &str, msg: &str| ContractDecision {
+        allow: false,
+        reason_code: code.into(),
+        message: msg.into(),
+    };
+
+    if !contract.armed || contract.level == "off" {
+        return allow("CONTROL_INACTIVE", "任务契约未启用");
+    }
+    let command = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
+    let path = args
+        .get("file_path")
+        .or_else(|| args.get("path"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let action = classify_action(tool, command);
+
+    // 委派预算必须**先于**"非变更类动作"的放行判定：
+    // 否则 subagent / workflow 这类不是 write 的动作会绕过预算。
+    if action == "delegate" {
+        let budget = if contract.agent_budget == 0 { 2 } else { contract.agent_budget };
+        if contract.agent_spent >= budget {
+            return deny(
+                "AGENT_BUDGET_EXHAUSTED",
+                &format!("委派预算已用尽（{}/{}）", contract.agent_spent, budget),
+            );
+        }
+        contract.agent_spent += 1;
+        return allow(
+            "WITHIN_CONTRACT",
+            &format!("委派已消耗预算 {}/{}", contract.agent_spent, budget),
+        );
+    }
+
+    let writing = matches!(
+        tool,
+        "write" | "edit" | "batch_write" | "batch_edit" | "str_replace_editor" | "pwsh" | "bash" | "run_command" | "delete_file"
+    );
+    if !writing {
+        return allow("WITHIN_CONTRACT", "非变更类动作");
+    }
+
+    // 模式禁止变更
+    if matches!(contract.mode.as_str(), "review" | "answer" | "monitor" | "watch") {
+        return deny(
+            "MODE_FORBIDS_MUTATION",
+            &format!("当前任务契约模式为 {}，不允许变更类操作", contract.mode),
+        );
+    }
+    // 可变更性未证实
+    if contract.mode == "observe" {
+        return deny(
+            "MUTABILITY_UNPROVEN",
+            "任务契约处于 observe 模式：变更未被证实授权，请先明确告知用户并取得同意",
+        );
+    }
+    // 破坏性类别永不放行
+    if DESTRUCTIVE_CATEGORIES.contains(&action.as_str()) {
+        return deny(
+            "DESTRUCTIVE_NOT_ALLOWED",
+            &format!("破坏性类别 {} 结构性不可授权", action),
+        );
+    }
+    // 路径越界
+    if !contract.allowed_paths.is_empty() && !path.is_empty() {
+        let p = path.replace('\\', "/").to_lowercase();
+        let ok = contract
+            .allowed_paths
+            .iter()
+            .any(|a| p.starts_with(&a.replace('\\', "/").to_lowercase()));
+        if !ok {
+            return deny("PATH_OUTSIDE_CONTRACT", &format!("{} 不在契约允许路径内", path));
+        }
+    } else if path.is_empty() && !command.is_empty() {
+        return deny("WRITE_PATH_UNPROVEN", "命令写入路径无法从参数证明");
+    }
+    // 类别不在契约内
+    if !contract.categories.is_empty()
+        && !NON_DESTRUCTIVE_CATEGORIES.contains(&action.as_str())
+        && !contract.categories.iter().any(|c| c == &action)
+    {
+        return deny(
+            "CATEGORY_NOT_IN_CONTRACT",
+            &format!("动作类别 {} 不在契约允许列表内", action),
+        );
+    }
+    // 委派预算
+    if action == "delegate" {
+        let budget = if contract.agent_budget == 0 { 2 } else { contract.agent_budget };
+        if contract.agent_spent >= budget {
+            return deny("AGENT_BUDGET_EXHAUSTED", &format!("委派预算已用尽（{}/{}）", contract.agent_spent, budget));
+        }
+        contract.agent_spent += 1;
+        return allow("WITHIN_CONTRACT", &format!("委派已消耗预算 {}/{}", contract.agent_spent, budget));
+    }
+    allow("WITHIN_CONTRACT", "在契约范围内")
+}
+
+// ════════════════════════════════════════════════════════
+// ③ 质量账本（移植自 dsh-rule-engine quality-ledger.js）
+// ════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QualityRow {
+    pub sig: String,
+    pub ts: i64,
+    pub rework: u32,
+    pub interventions: u32,
+    pub frictions: u32,
+    pub tokens: u64,
+}
+
+pub fn quality_ledger_path() -> PathBuf {
+    rule_engine_dir().join("quality-ledger.jsonl")
+}
+
+/// 任务签名：去引号 → 盘符绝对路径 → <path> → 数字 → <n> → 折叠空白 → 小写 → FNV-1a 前 12 位
+pub fn task_signature(text: &str) -> String {
+    let mut s = String::new();
+    let mut in_quote: Option<char> = None;
+    for ch in text.chars() {
+        if let Some(q) = in_quote {
+            if ch == q {
+                in_quote = None;
+            }
+            continue;
+        }
+        if ch == '"' || ch == '\'' || ch == '`' {
+            in_quote = Some(ch);
+            continue;
+        }
+        s.push(ch);
+    }
+    // 路径归一化
+    let mut out = String::new();
+    for token in s.split_whitespace() {
+        let t = if token.starts_with('/')
+            || token.contains(":/")
+            || token.contains(":\\")
+            || token.starts_with("\\\\")
+        {
+            "<path>"
+        } else {
+            token
+        };
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(t);
+    }
+    // 数字归一化
+    let mut normalized = String::new();
+    let mut prev_digit = false;
+    for ch in out.chars() {
+        if ch.is_ascii_digit() {
+            if !prev_digit {
+                normalized.push_str("<n>");
+            }
+            prev_digit = true;
+        } else {
+            normalized.push(ch);
+            prev_digit = false;
+        }
+    }
+    let normalized = normalized.to_lowercase();
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in normalized.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{:012x}", h & 0xffff_ffff_ffff)
+}
+
+/// 记一条质量记录
+pub fn record_quality(row: QualityRow) -> Result<(), String> {
+    let p = quality_ledger_path();
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&p)
+        .map_err(|e| format!("打开质量账本失败: {}", e))?;
+    let line = serde_json::to_string(&row).map_err(|e| e.to_string())?;
+    writeln!(f, "{}", line).map_err(|e| format!("写质量账本失败: {}", e))
+}
+
+pub fn load_quality_ledger() -> Vec<QualityRow> {
+    let Ok(text) = std::fs::read_to_string(quality_ledger_path()) else {
+        return vec![];
+    };
+    text.lines().filter_map(|l| serde_json::from_str::<QualityRow>(l).ok()).collect()
+}
+
+/// 按签名聚合趋势（最近 window 条 vs 之前 window 条）
+pub fn quality_trend(window: usize) -> Vec<(String, f64, f64, usize)> {
+    let rows = load_quality_ledger();
+    let mut by_sig: HashMap<String, Vec<&QualityRow>> = HashMap::new();
+    for r in &rows {
+        by_sig.entry(r.sig.clone()).or_default().push(r);
+    }
+    let w = window.max(1);
+    let mut out: Vec<(String, f64, f64, usize)> = Vec::new();
+    for (sig, list) in by_sig {
+        if list.len() < 2 {
+            continue;
+        }
+        let score = |rs: &[&QualityRow]| -> f64 {
+            if rs.is_empty() {
+                return 0.0;
+            }
+            let n = rs.len() as f64;
+            rs.iter().map(|r| r.rework as f64 + r.frictions as f64).sum::<f64>() / n
+        };
+        let split = list.len().saturating_sub(w);
+        let recent = score(&list[split..]);
+        let prev = score(&list[..split]);
+        out.push((sig, prev, recent, list.len()));
+    }
+    out.sort_by(|a, b| b.3.cmp(&a.3));
+    out.truncate(8);
+    out
+}
+
+// ════════════════════════════════════════════════════════
+// ④ 热词学习（移植自 dsh-rule-engine hotwords.js）
+// ════════════════════════════════════════════════════════
+
+pub const HOTWORD_CAP: usize = 500;
+pub const HOTWORD_MIN_LEN: usize = 2;
+pub const HOTWORD_MAX_LEN: usize = 12;
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct HotWords {
+    pub versions: u32,
+    pub words: Vec<String>,
+    pub updated_at: i64,
+}
+
+pub fn hotwords_path() -> PathBuf {
+    rule_engine_dir().join("rule-engine-hotwords.json")
+}
+
+pub fn load_hotwords() -> HotWords {
+    std::fs::read_to_string(hotwords_path())
+        .ok()
+        .and_then(|t| serde_json::from_str::<HotWords>(&t).ok())
+        .unwrap_or(HotWords { versions: 1, ..Default::default() })
+}
+
+/// 学习一个动作词（长度受限、去重、上限 500，原子写）
+pub fn learn_hotword(word: &str) -> Result<HotWords, String> {
+    let w = word.trim().to_lowercase();
+    let n = w.chars().count();
+    if n < HOTWORD_MIN_LEN || n > HOTWORD_MAX_LEN {
+        return Err(format!("热词长度需在 {}~{} 之间", HOTWORD_MIN_LEN, HOTWORD_MAX_LEN));
+    }
+    let mut hw = load_hotwords();
+    hw.versions = 1;
+    if !hw.words.contains(&w) {
+        hw.words.push(w);
+        if hw.words.len() > HOTWORD_CAP {
+            let drop_n = hw.words.len() - HOTWORD_CAP;
+            hw.words.drain(0..drop_n);
+        }
+    }
+    hw.updated_at = chrono::Utc::now().timestamp();
+    let p = hotwords_path();
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let tmp = p.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_string_pretty(&hw).unwrap_or_default())
+        .map_err(|e| format!("写热词失败: {}", e))?;
+    std::fs::rename(&tmp, &p).map_err(|e| format!("替换热词失败: {}", e))?;
+    Ok(hw)
+}
+
+/// 结合内置动作词 + 学习到的热词判断执行子句
+pub fn has_execute_clause_with_hotwords(user_text: &str) -> bool {
+    if has_execute_clause(user_text) {
+        return true;
+    }
+    let t = user_text.to_lowercase();
+    load_hotwords().words.iter().any(|w| t.contains(w))
 }
 
 #[cfg(test)]
@@ -1807,6 +2653,193 @@ mod tests {
         assert!(fingerprint_of("rm -rf D:/important").is_none());
         assert!(label_allows_in(&base, "rm -rf D:/important").is_none());
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ─── 文本审计 / 契约 / 质量账本 / 热词 ───
+
+    #[test]
+    fn text_audit_detects_promise_and_missing_verification() {
+        let mut st = TextAuditState::default();
+        let hits = text_audit("这个问题一定没问题，已经彻底解决了。", "修一下", &mut st);
+        assert!(hits.iter().any(|h| h.rule_id == "7"), "应检出承诺性表达");
+        assert!(
+            hits.iter().any(|h| h.rule_id == "23"),
+            "声称已完成但无验证证据应被检出"
+        );
+        // 有验证证据时不再报 23
+        let mut st2 = TextAuditState::default();
+        let hits2 = text_audit("已完成，测试通过。", "修一下", &mut st2);
+        assert!(!hits2.iter().any(|h| h.rule_id == "23"));
+    }
+
+    #[test]
+    fn text_audit_detects_empty_talk_and_bare_apology() {
+        let mut st = TextAuditState::default();
+        assert!(text_audit("好的", "做这个", &mut st).iter().any(|h| h.rule_id == "22"));
+        let mut st2 = TextAuditState::default();
+        let hits = text_audit("非常抱歉给您带来困扰。", "做这个", &mut st2);
+        assert!(hits.iter().any(|h| h.rule_id == "22"), "只道歉未给原因应被检出");
+        // 给出原因则不报
+        let mut st3 = TextAuditState::default();
+        let hits3 = text_audit("抱歉，原因是配置写错了，我会修正并避免。", "做这个", &mut st3);
+        assert!(!hits3.iter().any(|h| h.rule_id == "22"));
+    }
+
+    #[test]
+    fn injection_gate_is_once_per_rule_and_budgeted() {
+        let mut st = TextAuditState::default();
+        let now = 1000;
+        let hits = vec![TextHit {
+            rule_id: "7".into(), title: "t".into(), evidence: "e".into(), kind: "correct".into(),
+        }];
+        let (ok1, fresh) = should_deliver_injection(&mut st, &hits, now);
+        assert!(ok1 && fresh.len() == 1);
+        // 同一规则不重复投递
+        let (ok2, _) = should_deliver_injection(&mut st, &hits, now + 1);
+        assert!(!ok2, "同一规则只投递一次");
+        // 换规则：受"每小时 ≤3"预算限制（已有 1 次）
+        for (i, rid) in ["8", "9"].iter().enumerate() {
+            let h = vec![TextHit {
+                rule_id: rid.to_string(), title: "t".into(), evidence: "e".into(), kind: "correct".into(),
+            }];
+            let (ok, _) = should_deliver_injection(&mut st, &h, now + 2 + i as i64);
+            assert!(ok, "第 {} 条新规则应在预算内", i + 2);
+        }
+        // 第 4 条应被预算拦下
+        let h4 = vec![TextHit {
+            rule_id: "10".into(), title: "t".into(), evidence: "e".into(), kind: "correct".into(),
+        }];
+        let (ok4, _) = should_deliver_injection(&mut st, &h4, now + 10);
+        assert!(!ok4, "每小时最多 3 次注入");
+        // 一小时后预算恢复
+        let (ok5, _) = should_deliver_injection(&mut st, &h4, now + 3601);
+        assert!(ok5, "超过一小时预算应恢复");
+    }
+
+    #[test]
+    fn injection_text_matches_upstream_shape() {
+        let one = vec![TextHit {
+            rule_id: "7".into(), title: "承诺性表达".into(), evidence: "".into(), kind: "correct".into(),
+        }];
+        let s = render_injection(&one);
+        assert!(s.starts_with("[规则引擎]"));
+        assert!(s.contains("规则 7"));
+        // 多条聚合
+        let many = vec![
+            TextHit { rule_id: "7".into(), title: "a".into(), evidence: "".into(), kind: "correct".into() },
+            TextHit { rule_id: "23".into(), title: "b".into(), evidence: "".into(), kind: "correct".into() },
+        ];
+        let s2 = render_injection(&many);
+        assert!(s2.contains("本轮检出 2 项"));
+    }
+
+    #[test]
+    fn task_contract_blocks_and_allows() {
+        // 未启用 → 放行
+        let mut c = TaskContract::default();
+        let d = decide_contract_action(&mut c, "write", &json!({"file_path": "a.txt"}));
+        assert!(d.allow && d.reason_code == "CONTROL_INACTIVE");
+
+        // observe 模式 → 可变更性未证实
+        c.armed = true;
+        c.level = "guard".into();
+        c.mode = "observe".into();
+        let d = decide_contract_action(&mut c, "write", &json!({"file_path": "a.txt"}));
+        assert!(!d.allow && d.reason_code == "MUTABILITY_UNPROVEN");
+
+        // change 模式 + 路径约束
+        c.mode = "change".into();
+        c.allowed_paths = vec!["D:/proj".into()];
+        let d = decide_contract_action(&mut c, "write", &json!({"file_path": "D:/proj/a.rs"}));
+        assert!(d.allow, "契约内路径应放行：{}", d.message);
+        let d = decide_contract_action(&mut c, "write", &json!({"file_path": "D:/other/a.rs"}));
+        assert!(!d.allow && d.reason_code == "PATH_OUTSIDE_CONTRACT");
+
+        // 破坏性类别结构性不可授权
+        let d = decide_contract_action(&mut c, "bash", &json!({"command": "rm -rf D:/proj/x"}));
+        assert!(!d.allow && d.reason_code == "DESTRUCTIVE_NOT_ALLOWED");
+    }
+
+    #[test]
+    fn task_contract_delegation_budget() {
+        let mut c = TaskContract {
+            armed: true,
+            level: "guard".into(),
+            mode: "change".into(),
+            agent_budget: 2,
+            ..Default::default()
+        };
+        for _ in 0..2 {
+            let d = decide_contract_action(&mut c, "subagent", &json!({}));
+            assert!(d.allow, "预算内应放行");
+        }
+        let d = decide_contract_action(&mut c, "subagent", &json!({}));
+        assert!(!d.allow && d.reason_code == "AGENT_BUDGET_EXHAUSTED");
+        assert_eq!(c.agent_spent, 2);
+    }
+    #[test]
+    fn quality_signature_normalises_and_stays_stable() {
+        // 路径与数字归一化 → 同签名
+        assert_eq!(
+            task_signature("修复 D:/proj/a.rs 的第 42 行"),
+            task_signature("修复 D:/proj/b.rs 的第 99 行")
+        );
+        // 引号内容被剥离
+        assert_eq!(
+            task_signature("执行 \"rm -rf x\" 命令"),
+            task_signature("执行 命令")
+        );
+        assert_eq!(task_signature("x").len(), 12);
+        assert_ne!(task_signature("修复登录"), task_signature("新增支付"));
+    }
+
+    #[test]
+    fn hotword_learning_validates_length_and_dedupes() {
+        let base = rule_engine_dir().join("hw_test");
+        std::env::set_var("DEEPAHEAD_RULE_ENGINE_DIR", base.to_string_lossy().to_string());
+        let _ = std::fs::remove_dir_all(&base);
+        // 过短
+        assert!(learn_hotword("x").is_err());
+        // 过长
+        assert!(learn_hotword(&"a".repeat(20)).is_err());
+        // 正常
+        let hw = learn_hotword("部署").unwrap();
+        assert!(hw.words.contains(&"部署".to_string()));
+        // 去重
+        let hw2 = learn_hotword("部署").unwrap();
+        assert_eq!(hw2.words.iter().filter(|w| *w == "部署").count(), 1);
+        // 学到的热词参与执行子句判定
+        assert!(has_execute_clause_with_hotwords("帮我部署一下"));
+        std::env::remove_var("DEEPAHEAD_RULE_ENGINE_DIR");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn guard_command_extended_surface() {
+        let mut cfg = RuleEngineConfig::default();
+        let mut st = RuleEngineState::default();
+        // mode
+        assert!(run_guard_command(&mut cfg, &mut st, "/guard mode change").ok);
+        assert!(st.contract.armed && st.contract.mode == "change");
+        assert!(!run_guard_command(&mut cfg, &mut st, "/guard mode nonsense").ok);
+        // budget
+        assert!(run_guard_command(&mut cfg, &mut st, "/guard budget 5").ok);
+        assert_eq!(st.contract.agent_budget, 5);
+        // contract 细项
+        assert!(run_guard_command(&mut cfg, &mut st, "/guard contract hash allow").ok);
+        assert_eq!(st.contract.hash_policy, "allow");
+        assert!(run_guard_command(&mut cfg, &mut st, "/guard contract path D:/proj").ok);
+        assert!(st.contract.allowed_paths.contains(&"D:/proj".to_string()));
+        assert!(run_guard_command(&mut cfg, &mut st, "/guard contract").text.contains("任务契约"));
+        // approve 不允许 any
+        assert!(!run_guard_command(&mut cfg, &mut st, "/guard approve any D:/x").ok);
+        assert!(run_guard_command(&mut cfg, &mut st, "/guard approve write D:/x 5").ok);
+        assert_eq!(st.authorizations.len(), 1);
+        // quality（空账本也应正常返回）
+        assert!(run_guard_command(&mut cfg, &mut st, "/guard quality").ok);
+        // freedom 现在应列出新实现项
+        let f = run_guard_command(&mut cfg, &mut st, "/guard freedom").text;
+        assert!(f.contains("任务契约") && f.contains("质量账本"));
     }
 
     #[test]

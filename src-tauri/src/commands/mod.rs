@@ -9,6 +9,7 @@ pub mod session;
 pub mod marketplace;
 pub mod app;
 pub mod runner;
+pub mod update;
 
 pub use project::*;
 pub use ai::*;
@@ -21,3 +22,4 @@ pub use session::*;
 pub use marketplace::*;
 pub use app::*;
 pub use runner::*;
+pub use update::*;

@@ -584,6 +584,58 @@
       </div>
     </div>
 
+    <!-- 自动更新弹框：发现新版本 → 暂不更新（10 分钟后再提醒）/ 立即更新 -->
+    <div class="modal-overlay update-modal" :class="{ show: showUpdateModal }" @click.self="snoozeUpdate">
+      <div class="modal-box" style="width:560px">
+        <div class="modal-header">
+          <h3>🎉 发现新版本</h3>
+          <button class="modal-close" @click="snoozeUpdate">&times;</button>
+        </div>
+        <div class="modal-body">
+          <div class="update-versions">
+            <span class="update-cur">当前 {{ updateInfo?.current }}</span>
+            <span class="update-arrow">→</span>
+            <span class="update-new">{{ updateInfo?.latest }}</span>
+          </div>
+          <div v-if="updateInfo?.asset" class="update-asset">
+            安装包：<code>{{ updateInfo.asset.name }}</code>
+            <span v-if="updateInfo.asset.size">（{{ (updateInfo.asset.size / 1048576).toFixed(1) }} MB）</span>
+            <span v-else>（大小未知）</span>
+          </div>
+          <div v-if="updateInfo?.published_at" class="update-date">发布时间：{{ updateInfo.published_at }}</div>
+
+          <!-- 下载/安装进度 -->
+          <div v-if="updateBusy" class="update-progress">
+            <div class="update-progress-label">
+              <span v-if="updatePhase === 'downloading'">
+                正在从 Gitee 下载…（{{ (updateProgress.downloaded / 1048576).toFixed(1) }} MB<template v-if="updateProgress.total"> / {{ (updateProgress.total / 1048576).toFixed(1) }} MB</template>）
+              </span>
+              <span v-else>正在启动更新：应用即将退出，随后自动卸载旧版并安装新版…</span>
+            </div>
+            <div class="ai-ctx-bar">
+              <div class="ai-ctx-fill" :style="{ width: updatePct + '%' }"></div>
+            </div>
+          </div>
+
+          <div v-if="updateInfo?.notes" class="update-notes">
+            <div class="update-notes-title">更新内容</div>
+            <pre class="update-notes-body">{{ updateInfo.notes }}</pre>
+          </div>
+
+          <div class="update-hint">
+            更新流程：从 Gitee 下载安装包 → 退出当前版本 → 静默卸载旧版 → 静默安装新版 → 自动重新启动。
+            <br>选择「暂不更新」后每 10 分钟提醒一次，直到你点击「立即更新」。
+          </div>
+        </div>
+        <div class="form-actions">
+          <button class="btn btn-secondary" :disabled="updateBusy" @click="snoozeUpdate">暂不更新</button>
+          <button class="btn btn-primary" :disabled="updateBusy" @click="startUpdate">
+            {{ updateBusy ? (updatePhase === 'downloading' ? '下载中…' : '安装中…') : '立即更新' }}
+          </button>
+        </div>
+      </div>
+    </div>
+
     <!-- 设置弹框 -->
     <div class="modal-overlay" :class="{ show: showSettings }" @click.self="showSettings = false">
       <div class="modal-box">
@@ -997,7 +1049,7 @@
 import { ref, onMounted, nextTick, watch, computed } from "vue";
 import { useAppStore, MAX_PASTE_IMAGES, type LogKind } from "../stores/app";
 import { tauriAPI } from "../services/tauri-api";
-import type { GitGraphCommit, GitGraphLaneRow, LaneGlyph, TurnCard } from "../services/tauri-api";
+import type { GitGraphCommit, GitGraphLaneRow, LaneGlyph, TurnCard, UpdateInfo } from "../services/tauri-api";
 import FileTreeNode from "../components/layout/FileTreeNode.vue";
 import { createEditor, destroyEditor, getEditorContent, setEditorContent, setEditorLanguage, setEditorTheme } from "../utils/codemirror";
 import type { EditorView } from "@codemirror/view";
@@ -1226,6 +1278,101 @@ const multimodalEnabled = ref(false);
 const maxMode = ref(true);
 // 上下文窗口输入（AI 配置面板）
 const contextLimitInput = ref(store.contextLimit);
+
+// ─── 自动更新（检测 Gitee 新版本 → 提示 → 下载 → 卸载重装）───
+const showUpdateModal = ref(false);
+const updateInfo = ref<UpdateInfo | null>(null);
+const updateBusy = ref(false);
+const updatePhase = ref<"idle" | "downloading" | "installing">("idle");
+const updateProgress = ref({ downloaded: 0, total: 0 });
+/** 10 分钟提醒定时器（"暂不更新"后持续提醒，直到用户选择立即更新） */
+let updateRemindTimer: ReturnType<typeof setInterval> | null = null;
+const UPDATE_REMIND_MS = 10 * 60 * 1000;
+
+/** 检查更新；发现新版本则弹框 */
+async function checkForUpdate(): Promise<boolean> {
+  try {
+    const info = await tauriAPI.checkUpdate();
+    updateInfo.value = info;
+    if (info.has_update && info.asset) {
+      // 记录待更新版本，重启后仍会提示
+      localStorage.setItem("deep-ide-pending-update", info.latest);
+      showUpdateModal.value = true;
+      store.appendLog(
+        "system",
+        `发现新版本 ${info.latest}（当前 ${info.current}）`,
+        `安装包：${info.asset.name}`
+      );
+      return true;
+    }
+    // 已是最新 → 清掉待更新标记
+    localStorage.removeItem("deep-ide-pending-update");
+    return false;
+  } catch (e: any) {
+    // 检查失败静默，不打扰用户
+    console.warn("[DeepAhead] update check failed:", e);
+    return false;
+  }
+}
+
+/**
+ * "暂不更新"：关闭弹框但**每 10 分钟再次提醒**，
+ * 直到用户点击"立即更新"为止（跨重启也继续，因为待更新版本已落盘）。
+ */
+function snoozeUpdate() {
+  showUpdateModal.value = false;
+  store.appendLog("system", "已选择暂不更新（10 分钟后再次提醒）");
+  if (updateRemindTimer) clearInterval(updateRemindTimer);
+  updateRemindTimer = setInterval(async () => {
+    const pending = localStorage.getItem("deep-ide-pending-update");
+    if (!pending) { stopUpdateReminder(); return; }
+    // 先刷新一次信息（版本可能又更新了）
+    const found = await checkForUpdate();
+    if (found) {
+      showUpdateModal.value = true;
+      store.appendLog("system", `提醒：仍有待安装的新版本 ${pending}`);
+    }
+  }, UPDATE_REMIND_MS);
+}
+
+function stopUpdateReminder() {
+  if (updateRemindTimer) {
+    clearInterval(updateRemindTimer);
+    updateRemindTimer = null;
+  }
+}
+/** 下载进度百分比（总大小未知时按 0 显示为不确定态） */
+const updatePct = computed(() => {
+  const { downloaded, total } = updateProgress.value;
+  if (!total || total <= 0) return updatePhase.value === "downloading" ? 10 : 100;
+  return Math.min(100, (downloaded / total) * 100);
+});
+
+/**
+ * "立即更新"：下载新安装包 → 启动游离更新脚本 → 退出应用。
+ * 卸载与重装由脚本在本进程退出后串行完成（运行中的 exe 无法自替换）。
+ */
+async function startUpdate() {
+  const info = updateInfo.value;
+  if (!info?.asset) { alert("没有可用的安装包。"); return; }
+  updateBusy.value = true;
+  updatePhase.value = "downloading";
+  updateProgress.value = { downloaded: 0, total: 0 };
+  try {
+    const path = await tauriAPI.downloadUpdate(info.asset.download_url, info.asset.name);
+    updatePhase.value = "installing";
+    await tauriAPI.installUpdate(path);
+    localStorage.removeItem("deep-ide-pending-update");
+    stopUpdateReminder();
+    store.appendLog("system", "更新已启动：应用将退出，随后自动卸载旧版并安装新版");
+    // 给脚本一点启动时间，然后退出应用
+    setTimeout(() => { tauriAPI.quitForUpdate(); }, 800);
+  } catch (e: any) {
+    updateBusy.value = false;
+    updatePhase.value = "idle";
+    alert(`更新失败：${e}\n\n可稍后重试，或手动从 Gitee Releases 下载安装包。`);
+  }
+}
 
 // ─── 集成能力面板：费用统计 / 上下文引擎 / 长期记忆 / 规则引擎 / 插件体检 ───
 const costSnapshot = ref<any>(null);
@@ -1651,6 +1798,26 @@ onMounted(async () => {
   await store.loadTurnCards();
   // 初始化上下文占用显示（无需等待首次 Agent 运行）
   store.recomputeContextUsage();
+
+  // ─── 自动更新 ───
+  // 下载进度事件
+  await listen<{ downloaded: number; total: number }>("update-download-progress", (e) => {
+    updateProgress.value = e.payload;
+  });
+  // 启动后稍等再检查（不抢启动时的资源）；有待更新版本时立即提醒
+  setTimeout(async () => {
+    const pending = localStorage.getItem("deep-ide-pending-update");
+    const found = await checkForUpdate();
+    if (found || pending) {
+      // 若仍存在未安装的新版本 → 重新武装 10 分钟提醒
+      if (!found && pending) {
+        const info = await tauriAPI.checkUpdate();
+        updateInfo.value = info;
+        if (info.has_update && info.asset) showUpdateModal.value = true;
+      }
+      if (updateInfo.value?.has_update) snoozeUpdate();
+    }
+  }, 4000);
 });
 
 // ─── 基础导航 ───

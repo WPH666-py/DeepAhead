@@ -427,6 +427,19 @@ export const useAppStore = defineStore("app", () => {
                 "可在对话中逐条判定「拦对了 / 拦错了」（❌ 会使同类命令学习放行）"
               );
             }
+          } else if (k.type === "text_audit") {
+            // 文本审计：助手输出不可阻断，只把纠正文本注入会话
+            const injection = String(k.injection || "");
+            if (injection) {
+              addSystemMessage(injection);
+              appendLog(
+                "system",
+                "文本审计命中（已注入纠正）",
+                Array.isArray(k.hits)
+                  ? k.hits.map((h: any) => `规则 ${h.rule_id}：${h.title}`).join("\n")
+                  : undefined
+              );
+            }
           } else if (k.type === "context_compressed") {
             const before = (k.before_tokens || 0) / 1000;
             const after = (k.after_tokens || 0) / 1000;
