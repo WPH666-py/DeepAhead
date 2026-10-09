@@ -104,6 +104,10 @@
             <div class="dropdown-item" @click="openAiConfigTab">⚙️ AI 配置</div>
             <div class="dropdown-item" @click="openContextTab">📊 上下文占用</div>
             <div class="dropdown-item" @click="openCapabilitiesTab">🧩 集成能力</div>
+            <div class="dropdown-divider"></div>
+            <div class="dropdown-item" @click="manualCheckUpdate">
+              🔄 检查更新<template v-if="appVersion">（当前 {{ appVersion }}）</template>
+            </div>
           </div>
         </div>
       </div>
@@ -1317,32 +1321,52 @@ const updatePhase = ref<"idle" | "downloading" | "installing">("idle");
 const updateProgress = ref({ downloaded: 0, total: 0 });
 /** 10 分钟提醒定时器（"暂不更新"后持续提醒，直到用户选择立即更新） */
 let updateRemindTimer: ReturnType<typeof setInterval> | null = null;
+/** 长驻会话的定期复查定时器（6 小时） */
+let updateCheckTimer: ReturnType<typeof setInterval> | null = null;
 const UPDATE_REMIND_MS = 10 * 60 * 1000;
+const appVersion = ref("");
 
 /** 检查更新；发现新版本则弹框 */
 async function checkForUpdate(): Promise<boolean> {
   try {
     const info = await tauriAPI.checkUpdate();
     updateInfo.value = info;
+    // 把检查结果写进日志面板，便于排查"为什么没提示"
+    appendUpdateLog(info);
     if (info.has_update && info.asset) {
       // 记录待更新版本，重启后仍会提示
       localStorage.setItem("deep-ide-pending-update", info.latest);
       showUpdateModal.value = true;
-      store.appendLog(
-        "system",
-        `发现新版本 ${info.latest}（当前 ${info.current}）`,
-        `安装包：${info.asset.name}`
-      );
       return true;
     }
     // 已是最新 → 清掉待更新标记
     localStorage.removeItem("deep-ide-pending-update");
     return false;
   } catch (e: any) {
-    // 检查失败静默，不打扰用户
-    console.warn("[DeepAhead] update check failed:", e);
+    store.appendLog("system", "检查更新失败", String(e));
     return false;
   }
+}
+
+/** 检查更新的日志（成功/失败/无附件都要留痕，否则用户无从判断） */
+function appendUpdateLog(info: UpdateInfo) {
+  if (info.error) {
+    store.appendLog("system", `检查更新：${info.error}`, `当前 ${info.current}｜Gitee 最新 ${info.latest || "?"}`);
+    return;
+  }
+  if (!info.has_update) {
+    store.appendLog(
+      "system",
+      `检查更新：已是最新（当前 ${info.current}）`,
+      `Gitee 最新发布：${info.latest || "(无发布)"}`
+    );
+    return;
+  }
+  store.appendLog(
+    "system",
+    `发现新版本 ${info.latest}（当前 ${info.current}）`,
+    info.asset ? `安装包：${info.asset.name}` : "⚠️ 该发布下没有安装包附件，无法自动更新"
+  );
 }
 
 /**
@@ -1896,21 +1920,55 @@ onMounted(async () => {
   await listen<{ downloaded: number; total: number }>("update-download-progress", (e) => {
     updateProgress.value = e.payload;
   });
-  // 启动后稍等再检查（不抢启动时的资源）；有待更新版本时立即提醒
+
+  appVersion.value = await tauriAPI.appVersion().catch(() => "");
+
+  // 启动后稍等再检查（不抢启动时的资源）。
+  // ⚠️ 这里**绝不能**在发现更新后调用 snoozeUpdate()：那会把刚弹出来的弹框立刻关掉，
+  //    变成"要等 10 分钟才提示"（0.5.0 的实际表现）。只有用户点了「暂不更新」才武装定时器。
   setTimeout(async () => {
-    const pending = localStorage.getItem("deep-ide-pending-update");
     const found = await checkForUpdate();
-    if (found || pending) {
-      // 若仍存在未安装的新版本 → 重新武装 10 分钟提醒
-      if (!found && pending) {
-        const info = await tauriAPI.checkUpdate();
-        updateInfo.value = info;
-        if (info.has_update && info.asset) showUpdateModal.value = true;
-      }
-      if (updateInfo.value?.has_update) snoozeUpdate();
+    if (found) {
+      // 立刻展示，不隐藏、不武装定时器（等用户自己选）
+      return;
+    }
+    // 上次会话遗留的待更新版本：重新检查并直接提示
+    const pending = localStorage.getItem("deep-ide-pending-update");
+    if (pending) {
+      const info = await tauriAPI.checkUpdate().catch(() => null);
+      if (info) updateInfo.value = info;
+      if (info?.has_update && info.asset) showUpdateModal.value = true;
+      else localStorage.removeItem("deep-ide-pending-update");
     }
   }, 4000);
+
+  // 长驻会话期间定期复查（默认 6 小时），这样挂着不关也能收到新版本提示
+  if (updateCheckTimer) clearInterval(updateCheckTimer);
+  updateCheckTimer = setInterval(() => { checkForUpdate(); }, 6 * 60 * 60 * 1000);
 });
+
+/** 手动检查更新（AI 驾驶舱菜单入口；也是排查"为什么没提示"的手段） */
+async function manualCheckUpdate() {
+  closeDropdowns();
+  const info = await tauriAPI.checkUpdate().catch((e) => null);
+  updateInfo.value = info;
+  if (!info) {
+    alert("检查更新失败：无法访问 Gitee（请检查网络）。");
+    return;
+  }
+  if (info.error) {
+    alert(`检查更新失败：${info.error}`);
+    return;
+  }
+  if (info.has_update && info.asset) {
+    showUpdateModal.value = true;
+    return;
+  }
+  alert(
+    `已是最新版本。\n\n当前版本：${info.current}\nGitee 最新：${info.latest || "(无发布)"}` +
+    (info.asset ? `\n安装包：${info.asset.name}` : "\n（该发布下没有安装包附件）")
+  );
+}
 
 // ─── 基础导航 ───
 function toggleDropdown(n: string) { openDropdown.value = openDropdown.value === n ? "" : n; }

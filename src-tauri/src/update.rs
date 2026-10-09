@@ -299,4 +299,52 @@ mod tests {
         assert!(is_newer("v1", "0.9.9"));
         assert!(!is_newer("v1.0", "1.0.0"));
     }
+
+    /// 真实网络测试：验证 Rust 侧的 Gitee 检测链路确实能跑通
+    /// （不放进常规测试，避免离线环境失败）。
+    /// 运行：`cargo test --lib -- --ignored live_gitee`
+    #[tokio::test]
+    #[ignore]
+    async fn live_gitee_check_detects_published_release() {
+        // 用一个很旧的"当前版本"，必然应当检测到更新
+        let info = check_update(DEFAULT_REPO, "0.0.1").await;
+        println!("current={} latest={} has_update={} error={:?}",
+            info.current, info.latest, info.has_update, info.error);
+        assert!(info.error.is_none(), "检查更新报错：{:?}", info.error);
+        assert!(!info.latest.is_empty(), "未能从 Gitee 读到任何发布");
+        assert!(info.has_update, "0.0.1 应当检测到更新，实际 latest={}", info.latest);
+        let asset = info.asset.as_ref().expect("应当找到安装包附件");
+        println!("asset={} size={} url={}", asset.name, asset.size, asset.download_url);
+        assert!(asset.name.to_lowercase().ends_with(".exe"));
+        assert!(asset.download_url.starts_with("https://gitee.com/"));
+    }
+
+    /// 真实网络测试：安装包下载可达（只取前 256 KiB 验证，不落整包）
+    #[tokio::test]
+    #[ignore]
+    async fn live_gitee_installer_is_downloadable() {
+        let info = check_update(DEFAULT_REPO, "0.0.1").await;
+        let asset = info.asset.expect("需要安装包");
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(60))
+            .user_agent("DeepAhead-Updater")
+            .build()
+            .unwrap();
+        let resp = client
+            .get(&asset.download_url)
+            .header("Range", "bytes=0-262143")
+            .send()
+            .await
+            .expect("下载请求失败");
+        println!("status={}", resp.status());
+        assert!(
+            resp.status().is_success(),
+            "下载应成功，实际 {}",
+            resp.status()
+        );
+        let bytes = resp.bytes().await.expect("读取响应体失败");
+        println!("received {} bytes", bytes.len());
+        assert!(bytes.len() > 1024, "收到的内容过少");
+        assert_eq!(&bytes[0..2], b"MZ", "安装包应以 MZ 开头");
+    }
 }
