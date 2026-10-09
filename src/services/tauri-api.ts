@@ -244,7 +244,19 @@ export const tauriAPI = {
 
   // ─── 长期记忆协议（dsh-memory-protocol 移植）───
   getMemoryConfig: () => invoke<MemoryConfigInfo>("get_memory_config"),
-  setMemoryConfig: (patch: Partial<MemoryConfigInfo>) => invoke<MemoryConfigInfo>("set_memory_config", patch as any),
+  /**
+   * 更新长期记忆配置。
+   * 同 rulesSetToggles：Rust 侧是 enforce_weave / inject_weave / auto_ingest / fail_open，
+   * JS 侧必须传 camelCase，否则参数被静默忽略（开关会"点了没反应"）。
+   */
+  setMemoryConfig: (patch: {
+    enabled?: boolean;
+    enforceWeave?: boolean;
+    injectWeave?: boolean;
+    autoIngest?: boolean;
+    allowlist?: string[];
+    failOpen?: boolean;
+  }) => invoke<MemoryConfigInfo>("set_memory_config", patch),
   memoryWeave: (query: string, topK?: number) => invoke<string>("memory_weave", { query, topK: topK ?? null }),
   memoryIngest: (content: string, role?: string, kind?: string) =>
     invoke<any>("memory_ingest", { content, role: role ?? null, kind: kind ?? null }),
@@ -268,7 +280,12 @@ export const tauriAPI = {
   rulesTestGuard: (tool: string, args?: any, userText?: string) =>
     invoke<any>("rules_test_guard", { tool, arguments: args ?? null, userText: userText ?? null }),
   rulesGetConfig: () => invoke<any>("rules_get_config"),
-  rulesSetToggles: (patch: { enabled?: boolean; turn_card_enabled?: boolean; task_contract_enabled?: boolean }) =>
+  /**
+   * 应用规则引擎开关。
+   * 注意：Tauri v2 会把 Rust 侧的 snake_case 参数名转成 camelCase，
+   * 因此这里必须传 turnCardEnabled / taskContractEnabled，传 snake_case 会被静默忽略。
+   */
+  rulesSetToggles: (patch: { enabled?: boolean; turnCardEnabled?: boolean; taskContractEnabled?: boolean }) =>
     invoke<any>("rules_set_toggles", patch),
   rulesGuardCommand: (input: string) => invoke<{ ok: boolean; text: string }>("rules_guard_command", { input }),
   rulesTurnCards: (sessionId?: string, limit?: number) =>

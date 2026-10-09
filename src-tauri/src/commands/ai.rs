@@ -528,6 +528,10 @@ pub fn get_memory_config() -> serde_json::Value {
 }
 
 /// 更新长期记忆配置
+///
+/// ⚠️ 同样受 Tauri v2 camelCase 约定约束：
+/// `enforce_weave` ← `enforceWeave`、`inject_weave` ← `injectWeave`、
+/// `auto_ingest` ← `autoIngest`、`fail_open` ← `failOpen`。
 #[tauri::command]
 pub fn set_memory_config(
     enabled: Option<bool>,
@@ -713,6 +717,11 @@ pub fn rules_get_config() -> serde_json::Value {
 }
 
 /// 应用界面开关（即时影响 agent loop 的硬门与裁决卡片）
+///
+/// ⚠️ Tauri v2 参数命名约定：`#[tauri::command]` 默认 `rename_all = "camelCase"`，
+/// Rust 侧的 snake_case 形参在 JS 侧必须用 camelCase 传
+/// （`turn_card_enabled` ← `turnCardEnabled`）。传错会被**静默忽略**，
+/// 表现为"开关点了没反应"。
 #[tauri::command]
 pub fn rules_set_toggles(
     enabled: Option<bool>,

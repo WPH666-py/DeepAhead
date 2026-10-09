@@ -90,10 +90,22 @@
             <div v-if="store.sessionLogs.length === 0" class="dropdown-item" style="color:#999">暂无日志</div>
           </div>
         </div>
-        <!-- AI 配置：打开配置弹窗 -->
-        <button class="menu-button" title="打开 AI 配置（模型/视觉识别）" @click="openAIConfig">AI配置</button>
-        <!-- 集成能力：费用 / 上下文 / 记忆 / 规则 / 体检 -->
-        <button class="menu-button" title="费用统计 · 上下文压缩 · 长期记忆 · 规则引擎 · 插件体检" @click="openCapabilities">🧩 集成能力</button>
+        <!-- AI 驾驶舱：AI 配置 / 上下文占用 / 集成能力（下拉菜单） -->
+        <div style="position:relative">
+          <button
+            class="menu-button"
+            :class="{ active: openDropdown === 'aiCockpit' }"
+            title="AI 驾驶舱：模型与视觉配置、上下文占用、集成能力"
+            @click="toggleDropdown('aiCockpit')"
+          >
+            🧠 AI 驾驶舱 &#9662;
+          </button>
+          <div class="dropdown-menu" :class="{ show: openDropdown === 'aiCockpit' }">
+            <div class="dropdown-item" @click="openAiConfigTab">⚙️ AI 配置</div>
+            <div class="dropdown-item" @click="openContextTab">📊 上下文占用</div>
+            <div class="dropdown-item" @click="openCapabilitiesTab">🧩 集成能力</div>
+          </div>
+        </div>
       </div>
     </div>
 
@@ -584,6 +596,61 @@
       </div>
     </div>
 
+    <!-- 上下文占用（AI 驾驶舱 · 独立入口，原 AI 配置里的那一块移到这里） -->
+    <div class="modal-overlay" :class="{ show: showContextModal }" @click.self="showContextModal = false">
+      <div class="modal-box" style="width:520px">
+        <div class="modal-header">
+          <h3>📊 上下文占用</h3>
+          <button class="modal-close" @click="showContextModal = false">&times;</button>
+        </div>
+        <div class="modal-body">
+          <div class="ctx-config-box">
+            <div class="ctx-config-head">
+              <span class="ctx-config-pct" :class="{ warn: store.contextWarning }">{{ store.contextPercent }}%</span>
+              <span class="ctx-config-tokens">
+                当前对话 ~{{ (store.contextTokens / 1000).toFixed(1) }}k / 窗口 {{ (store.contextLimit / 1000).toFixed(0) }}k Tokens
+              </span>
+            </div>
+            <div class="ai-ctx-bar">
+              <div class="ai-ctx-fill" :class="{ warn: store.contextWarning }" :style="{ width: Math.min(store.contextPercent, 100) + '%' }"></div>
+            </div>
+            <div class="config-field" style="margin-top:0.6rem">
+              <label>上下文窗口（Tokens）</label>
+              <input type="number" min="1000" step="1000" v-model.number="contextLimitInput" placeholder="128000">
+            </div>
+            <div class="config-field">
+              <label>压缩模式</label>
+              <select :value="store.compressionMode" @change="onCompressionModeChange" style="width:100%;padding:0.45rem 0.5rem;border:1px solid #ccc;border-radius:5px">
+                <option value="manual">手动压缩（超过 85% 提示建议压缩上下文或清空当前对话）</option>
+                <option value="auto">自动压缩（超过 85% 自动压缩用户上下文，不清空对话）</option>
+              </select>
+            </div>
+            <div class="ctx-config-hint">
+              {{ store.compressionMode === 'auto'
+                ? '自动模式：占用 ≥85% 时自动压缩较早的对话轮次，当前对话与最近轮次保留，不会被清空。'
+                : '手动模式：占用 ≥85% 时只提示，不自动改动上下文；你可随时点击下方按钮手动压缩。' }}
+            </div>
+          </div>
+
+          <!-- 压缩引擎阈值（billion-context 移植） -->
+          <div v-if="ctxEngine" class="ctx-engine">
+            <div class="cap-sub">压缩引擎阈值（billion-context 移植）</div>
+            <div class="cap-row"><span>OVER-LIMIT</span><span class="cap-val">{{ (ctxEngine.max_context_limit_pct * 100).toFixed(0) }}%</span></div>
+            <div class="cap-row"><span>EMERGENCY</span><span class="cap-val">{{ (ctxEngine.emergency_threshold_pct * 100).toFixed(0) }}%</span></div>
+            <div class="cap-row"><span>nudge 增长步长</span><span class="cap-val">{{ (ctxEngine.nudge_growth_tokens / 1000).toFixed(0) }}k（恒定，不随窗口缩放）</span></div>
+            <div class="cap-row"><span>增长门槛</span><span class="cap-val">{{ (ctxEngine.growth_floor / 1000).toFixed(1) }}k</span></div>
+            <div class="cap-row"><span>保留最近</span><span class="cap-val">{{ ctxEngine.preserve_recent_messages }} 条 / {{ ctxEngine.preserve_recent_tokens }} Tokens</span></div>
+          </div>
+
+          <div class="form-actions" style="margin-top:1rem">
+            <button class="btn btn-secondary" @click="showContextModal = false">取消</button>
+            <button class="btn btn-secondary" :disabled="store.isLoading" @click="doManualCompress">🗜 立即压缩</button>
+            <button class="btn btn-primary" @click="saveContextSettings">保存设置</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- 自动更新弹框：发现新版本 → 暂不更新（10 分钟后再提醒）/ 立即更新 -->
     <div class="modal-overlay update-modal" :class="{ show: showUpdateModal }" @click.self="snoozeUpdate">
       <div class="modal-box" style="width:560px">
@@ -782,56 +849,18 @@
           </div>
           <div class="config-field"><label>API Key</label><input type="password" v-model="apiKeyInput" placeholder="sk-..."></div>
           <div class="config-field"><label>Base URL</label><input v-model="baseUrlInput" placeholder="https://api.deepseek.com"></div>
-          <!-- 主模型只支持 DeepSeek 模型 -->
           <div class="config-field">
-            <label>Model（主模型只支持 DeepSeek）</label>
-            <select :value="modelPreset" @change="onModelPresetChange" style="width:100%;padding:0.45rem 0.5rem;border:1px solid #ccc;border-radius:5px">
+            <label>Model（主模型只支持 DeepSeek，请手动输入）</label>
+            <input v-model="modelInput" list="deepseek-model-hints" placeholder="如 deepseek-chat / deepseek-reasoner / deepseek-v4">
+            <datalist id="deepseek-model-hints">
               <option v-for="m in DEEPSEEK_MODELS" :key="m.id" :value="m.id">{{ m.label }}</option>
-              <option value="__custom__">自定义 DeepSeek 模型……</option>
-            </select>
-          </div>
-          <div class="config-field" v-if="modelPreset === '__custom__'">
-            <label>自定义模型名（必须为 DeepSeek 模型）</label>
-            <input v-model="modelInput" placeholder="如 deepseek-v4 / deepseek-ai/DeepSeek-V4">
-          </div>
-          <div class="config-field" v-else>
-            <div class="config-model-locked">
-              ✅ 主模型已锁定为 <b>{{ modelInput }}</b> —— 运行时只走 DeepSeek Token。
+            </datalist>
+            <div v-if="modelInput.trim() && !isDeepSeekModel(modelInput)" class="config-vision-notice" style="margin-top:0.3rem">
+              ⚠️ 主模型名必须包含 <b>deepseek</b>（大小写不限）。当前填写的是「{{ modelInput }}」，不是 DeepSeek 模型，保存时会被拒绝。
             </div>
-          </div>
-
-          <!-- ─── 上下文占用比例 + 压缩上下文 ─── -->
-          <div style="border-top:1px solid #eee;margin:0.9rem 0 0.6rem"></div>
-          <label style="font-weight:500;color:#333">📊 上下文占用</label>
-          <div class="ctx-config-box">
-            <div class="ctx-config-head">
-              <span class="ctx-config-pct" :class="{ warn: store.contextWarning }">{{ store.contextPercent }}%</span>
-              <span class="ctx-config-tokens">
-                当前对话 ~{{ (store.contextTokens / 1000).toFixed(1) }}k / 窗口 {{ (store.contextLimit / 1000).toFixed(0) }}k Tokens
-              </span>
+            <div v-else-if="modelInput.trim()" class="config-model-locked" style="margin-top:0.3rem">
+              ✅ 已识别为 DeepSeek 模型：<b>{{ modelInput }}</b>
             </div>
-            <div class="ai-ctx-bar">
-              <div class="ai-ctx-fill" :class="{ warn: store.contextWarning }" :style="{ width: Math.min(store.contextPercent, 100) + '%' }"></div>
-            </div>
-            <div class="config-field" style="margin-top:0.55rem">
-              <label>上下文窗口（Tokens）</label>
-              <input type="number" min="1000" step="1000" v-model.number="contextLimitInput" @change="applyContextLimit" placeholder="128000">
-            </div>
-            <div class="config-field">
-              <label>压缩模式</label>
-              <select :value="store.compressionMode" @change="onCompressionModeChange" style="width:100%;padding:0.45rem 0.5rem;border:1px solid #ccc;border-radius:5px">
-                <option value="manual">手动压缩（超过 85% 提示建议压缩上下文或清空当前对话）</option>
-                <option value="auto">自动压缩（超过 85% 自动压缩用户上下文，不清空对话）</option>
-              </select>
-            </div>
-            <div class="ctx-config-hint">
-              {{ store.compressionMode === 'auto'
-                ? '自动模式：占用 ≥85% 时自动压缩较早的对话轮次，当前对话与最近轮次保留，不会被清空。'
-                : '手动模式：占用 ≥85% 时只提示，不自动改动上下文；你可随时点击下方按钮手动压缩。' }}
-            </div>
-            <button class="btn btn-secondary" style="width:100%;font-size:0.82rem" :disabled="store.isLoading" @click="doManualCompress">
-              🗜 立即压缩上下文
-            </button>
           </div>
 
           <!-- 视觉引擎开启时：显示视觉识别设置 -->
@@ -990,14 +1019,18 @@
                 </div>
               </div>
               <div v-else class="cap-hint">暂无审计记录。</div>
-              <!-- 回合末裁决卡片：与任务契约同组，默认关闭（对齐上游） -->
+              <!-- 回合末裁决卡片 / 任务契约：勾选只改草稿，底部「保存设置」统一提交 -->
               <div class="cap-sub">开关</div>
               <label class="cap-check">
-                <input type="checkbox" :checked="rulesCfg?.turn_card_enabled" @change="onRulesToggle('turn_card_enabled', $event)">
+                <input type="checkbox" v-model="rulesDraft.enabled">
+                <span>启用规则引擎（关闭后硬门与裁决卡片都不生效）</span>
+              </label>
+              <label class="cap-check">
+                <input type="checkbox" v-model="rulesDraft.turnCardEnabled">
                 <span>回合末裁决卡片（默认关；开启后每轮被拦记录会生成 ✅/❌ 可判卡片）</span>
               </label>
               <label class="cap-check">
-                <input type="checkbox" :checked="rulesCfg?.task_contract_enabled" @change="onRulesToggle('task_contract_enabled', $event)">
+                <input type="checkbox" v-model="rulesDraft.taskContractEnabled">
                 <span>任务契约（与裁决卡片同组，默认关）</span>
               </label>
               <!-- /guard 命令行 -->
@@ -1020,7 +1053,13 @@
                 </div>
               </div>
             </template>
-            <div class="cap-actions"><button class="btn btn-secondary" style="font-size:0.78rem" @click="refreshRules">刷新</button></div>
+            <!-- 底部操作区：保存设置（提交整页配置） -->
+            <div class="cap-actions">
+              <button class="btn btn-secondary" style="font-size:0.78rem" @click="refreshRules">刷新</button>
+              <button class="btn btn-primary" style="font-size:0.78rem" @click="saveRulesSettings">
+                {{ rulesSaved ? '✅ 已保存' : '保存设置' }}
+              </button>
+            </div>
           </template>
 
           <!-- 插件体检（dsh-plugin-vet） -->
@@ -1075,6 +1114,7 @@ const showMarketplace = ref(false);
 const showGitPushModal = ref(false);
 const showGitHistoryModal = ref(false);
 const showCapModal = ref(false);
+const showContextModal = ref(false);
 const showFilePicker = ref(false);
 const showTerminal = ref(false);
 const showImagePreview = ref(false);
@@ -1232,30 +1272,20 @@ const apiKeyInput = ref("");
 const baseUrlInput = ref("https://api.deepseek.com");
 const modelInput = ref("deepseek-chat");
 
-// ─── 主模型：只支持 DeepSeek 模型 ───
+// ─── 主模型：只支持 DeepSeek 模型（用户手动输入，校验必须含 deepseek）───
 const DEEPSEEK_MODELS = [
-  { id: "deepseek-chat",     label: "deepseek-chat（DeepSeek V4 通用 · Agent/工具调用）" },
-  { id: "deepseek-reasoner", label: "deepseek-reasoner（DeepSeek V4 推理 · thinking）" },
-  { id: "deepseek-coder",    label: "deepseek-coder（代码专用）" },
-  { id: "deepseek-vl",       label: "deepseek-vl（多模态识图，可选）" },
+  { id: "deepseek-chat",     label: "DeepSeek V4 通用 · Agent/工具调用" },
+  { id: "deepseek-reasoner", label: "DeepSeek V4 推理 · thinking" },
+  { id: "deepseek-coder",    label: "代码专用" },
+  { id: "deepseek-vl",       label: "多模态识图（可选）" },
 ];
-/** 仅当主模型名包含 deepseek 时才被接受（含代理前缀写法，如 deepseek-ai/DeepSeek-V4） */
+/**
+ * 是否接受为主模型：名称必须包含 deepseek（大小写不限，
+ * 因此 deepseek / DeepSeek / DEEPSEEK 都通过）。
+ * 允许代理前缀写法，如 deepseek-ai/DeepSeek-V4。
+ */
 function isDeepSeekModel(name: string): boolean {
   return /deepseek/i.test((name || "").trim());
-}
-/** 下拉选中项：命中预设则用预设 id，否则进入"自定义" */
-const modelPreset = computed(() =>
-  DEEPSEEK_MODELS.some(m => m.id === modelInput.value) ? modelInput.value : "__custom__"
-);
-function onModelPresetChange(e: Event) {
-  const v = (e.target as HTMLSelectElement).value;
-  if (v === "__custom__") {
-    if (isDeepSeekModel(modelInput.value) && DEEPSEEK_MODELS.some(m => m.id === modelInput.value)) {
-      modelInput.value = "";
-    }
-    return;
-  }
-  modelInput.value = v;
 }
 
 const termInput = ref("");
@@ -1389,6 +1419,12 @@ const vetBusy = ref(false);
 const capTab = ref("cost");
 // 规则引擎面板：配置 / /guard 命令行 / 指纹放行
 const rulesCfg = ref<any>(null);
+/**
+ * 规则引擎开关的"草稿"状态。
+ * 页面上的勾选只改草稿，点「保存设置」才写回后端 —— 这样一次保存的是整页配置。
+ */
+const rulesDraft = ref({ enabled: true, turnCardEnabled: false, taskContractEnabled: false });
+const rulesSaved = ref(false);
 const guardCommand = ref("");
 const guardOutput = ref("");
 const guardBusy = ref(false);
@@ -1396,26 +1432,52 @@ const rulesLabels = ref<any[]>([]);
 
 async function refreshRulesConfig() {
   try {
-    rulesCfg.value = await tauriAPI.rulesGetConfig();
+    const cfg = await tauriAPI.rulesGetConfig();
+    rulesCfg.value = cfg;
+    rulesDraft.value = {
+      enabled: cfg?.enabled !== false,
+      turnCardEnabled: !!cfg?.turn_card_enabled,
+      taskContractEnabled: !!cfg?.task_contract_enabled,
+    };
     const l = await tauriAPI.rulesLabels();
     rulesLabels.value = l.labels || [];
   } catch (_) { rulesCfg.value = null; }
 }
-/** 规则引擎开关（即时写回后端全局配置 → 影响下一次 Agent 运行的硬门与裁决卡片） */
-async function onRulesToggle(key: string, e: Event) {
+
+/** 勾选只改草稿（不落盘），底部「保存设置」才提交整页配置 */
+function onRulesDraftToggle(key: "enabled" | "turnCardEnabled" | "taskContractEnabled", e: Event) {
   const val = (e.target as HTMLInputElement).checked;
-  rulesCfg.value = { ...(rulesCfg.value || {}), [key]: val };
-  localStorage.setItem(`deep-ide-rules-${key}`, JSON.stringify(val));
+  rulesDraft.value = { ...rulesDraft.value, [key]: val };
+  rulesSaved.value = false;
+}
+
+/** 保存设置：把当前页面的规则引擎配置写回后端并本地持久化 */
+async function saveRulesSettings() {
   try {
-    rulesCfg.value = await tauriAPI.rulesSetToggles({ [key]: val } as any);
-  } catch (err: any) {
-    store.addSystemMessage(`规则引擎开关写入失败: ${err}`);
-  }
-  store.appendLog("system", `规则引擎 ${key} → ${val ? "开启" : "关闭"}`);
-  if (key === "turn_card_enabled") {
-    store.addSystemMessage(val
-      ? "已开启回合末裁决卡片：被拦记录会生成可判定卡片（✅拦对了 / ❌拦错了）"
-      : "已关闭回合末裁决卡片");
+    const saved = await tauriAPI.rulesSetToggles({
+      enabled: rulesDraft.value.enabled,
+      turnCardEnabled: rulesDraft.value.turnCardEnabled,
+      taskContractEnabled: rulesDraft.value.taskContractEnabled,
+    });
+    rulesCfg.value = saved;
+    rulesDraft.value = {
+      enabled: saved?.enabled !== false,
+      turnCardEnabled: !!saved?.turn_card_enabled,
+      taskContractEnabled: !!saved?.task_contract_enabled,
+    };
+    localStorage.setItem("deep-ide-rules-cfg", JSON.stringify(rulesDraft.value));
+    rulesSaved.value = true;
+    setTimeout(() => { rulesSaved.value = false; }, 2500);
+    store.appendLog(
+      "system",
+      "规则引擎设置已保存",
+      `裁决卡片 ${rulesDraft.value.turnCardEnabled ? "开" : "关"}｜任务契约 ${rulesDraft.value.taskContractEnabled ? "开" : "关"}｜引擎 ${rulesDraft.value.enabled ? "开" : "关"}`
+    );
+    store.addSystemMessage(
+      `规则引擎设置已保存：回合末裁决卡片 ${rulesDraft.value.turnCardEnabled ? "开" : "关"}，任务契约 ${rulesDraft.value.taskContractEnabled ? "开" : "关"}`
+    );
+  } catch (e: any) {
+    alert(`保存规则引擎设置失败：${e}`);
   }
 }
 async function runGuard() {
@@ -1464,12 +1526,32 @@ async function refreshRules() {
 async function refreshCapabilities() {
   await Promise.all([refreshCost(), refreshCtxEngine(), refreshMemory(), refreshRules(), refreshRulesConfig()]);
 }
+/**
+ * 记忆配置开关。
+ * 键名必须是 Tauri 期望的 camelCase（enforceWeave / injectWeave / autoIngest / failOpen），
+ * 传 snake_case 会被静默忽略 —— 这正是"开关点了没反应"的原因。
+ */
+const MEMORY_TOGGLE_KEYS: Record<string, "enabled" | "enforceWeave" | "injectWeave" | "autoIngest" | "failOpen"> = {
+  enabled: "enabled",
+  enforce_weave: "enforceWeave",
+  inject_weave: "injectWeave",
+  auto_ingest: "autoIngest",
+  fail_open: "failOpen",
+};
 async function onMemoryToggle(key: string, e: Event) {
   const val = (e.target as HTMLInputElement).checked;
+  const wireKey = MEMORY_TOGGLE_KEYS[key] || "enabled";
+  // 先乐观更新，避免勾选"弹回"
+  memoryConfig.value = { ...(memoryConfig.value || {}), [key]: val };
   try {
-    memoryConfig.value = await tauriAPI.setMemoryConfig({ [key]: val } as any);
+    const saved = await tauriAPI.setMemoryConfig({ [wireKey]: val } as any);
+    memoryConfig.value = saved;
     store.appendLog("system", `长期记忆 ${key} → ${val ? "开启" : "关闭"}`);
-  } catch (err: any) { alert("更新记忆配置失败: " + err); }
+  } catch (err: any) {
+    // 失败时回滚并明确告知，而不是静默
+    memoryConfig.value = { ...(memoryConfig.value || {}), [key]: !val };
+    store.addSystemMessage(`记忆配置写入失败: ${err}`);
+  }
 }
 async function doMemoryClear() {
   const ok = await showInlineConfirm("清空长期记忆", "将删除全部长期记忆记录（不可恢复）。确定继续吗？");
@@ -1790,9 +1872,19 @@ onMounted(async () => {
   loadInstalledExtensions();
   // 恢复规则引擎开关（裁决卡片 / 任务契约），写回后端全局配置
   try {
-    const tc = JSON.parse(localStorage.getItem("deep-ide-rules-turn_card_enabled") || "false");
-    const tk = JSON.parse(localStorage.getItem("deep-ide-rules-task_contract_enabled") || "false");
-    await tauriAPI.rulesSetToggles({ turn_card_enabled: tc, task_contract_enabled: tk });
+    const saved = JSON.parse(localStorage.getItem("deep-ide-rules-cfg") || "null");
+    if (saved) {
+      rulesDraft.value = {
+        enabled: saved.enabled !== false,
+        turnCardEnabled: !!saved.turnCardEnabled,
+        taskContractEnabled: !!saved.taskContractEnabled,
+      };
+      await tauriAPI.rulesSetToggles({
+        enabled: rulesDraft.value.enabled,
+        turnCardEnabled: rulesDraft.value.turnCardEnabled,
+        taskContractEnabled: rulesDraft.value.taskContractEnabled,
+      });
+    }
   } catch (_) {}
   // 恢复已落盘的回合裁决卡片（重启后仍可跨回合补裁）
   await store.loadTurnCards();
@@ -2438,6 +2530,15 @@ function applyContextLimit() {
   contextLimitInput.value = store.contextLimit;
   store.appendLog("context", `上下文窗口设置为 ${(store.contextLimit / 1000).toFixed(0)}k Tokens`);
 }
+/** 保存上下文占用页设置（窗口 + 压缩模式）并刷新引擎阈值 */
+async function saveContextSettings() {
+  applyContextLimit();
+  await refreshCtxEngine();
+  store.addSystemMessage(
+    `上下文设置已保存：窗口 ${(store.contextLimit / 1000).toFixed(0)}k Tokens，压缩模式 ${store.compressionMode === "auto" ? "自动" : "手动"}`
+  );
+  showContextModal.value = false;
+}
 
 // 当前激活 Tab 的类型（用于显示预览/编辑切换按钮）
 const activeTabKind = computed(() => {
@@ -2624,6 +2725,22 @@ function toggleMultimodal(e: Event) {
 async function openCapabilities() {
   showCapModal.value = true;
   await refreshCapabilities();
+}
+// ─── AI 驾驶舱：三个下拉入口 ───
+function openAiConfigTab() {
+  closeDropdowns();
+  openAIConfig();
+}
+function openContextTab() {
+  closeDropdowns();
+  contextLimitInput.value = store.contextLimit;
+  refreshCtxEngine();
+  showContextModal.value = true;
+}
+function openCapabilitiesTab() {
+  closeDropdowns();
+  capTab.value = "cost";
+  openCapabilities();
 }
 async function openAIConfig() {
   contextLimitInput.value = store.contextLimit;
