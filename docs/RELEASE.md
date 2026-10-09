@@ -122,6 +122,19 @@ curl.exe -s -X POST "https://gitee.com/api/v5/repos/ph-wang_admin/DeepAhead/rele
 ```
 
 > 附件若重复上传，Gitee 的 API **不支持删除**（DELETE 返回 405），只能在网页上编辑该 Release 手动删。
+>
+> ⚠️ **坑 4：Gitee 仓库附件配额 1 GB**。每个安装包约 96 MB，**大约 10 个版本就会撞满**，
+> 之后上传直接返回 `{"message":"验证失败：文件大小已超出仓库附件配额：1 GB"}`。
+> 配额是**按仓库算**的（所有 Release 的附件合计），且**没有任何 API 能删附件**
+> （`DELETE/POST .../attach_files/{id}` 全是 404/405），只能：
+>
+> 1. 打开 `https://gitee.com/ph-wang_admin/DeepAhead/releases`；
+> 2. 进一个**旧版本**的 Release → 编辑 → 删除其中的 `DeepAhead_x.y.z_x64-setup.exe` 附件；
+> 3. 删 2 个（≈192 MB）就够再发一版。
+>
+> **发布前先算配额**：只保留最近 2 个版本的安装包（用户从最近一版升级即可），
+> 更早的版本删掉附件、保留 tag 与说明文字（历史仍然可查）。
+
 
 ### 5.2 GitHub
 
