@@ -90,6 +90,11 @@ pub enum AgentEventKind {
     ToolCallRequested { id: String, name: String, arguments: String },
     /// 工具执行完成
     ToolCallExecuted { id: String, name: String, success: bool, output: String },
+    /// 工具仍在执行（心跳：每 ~20s 一次，elapsed_secs = 已耗时秒数）
+    ///
+    /// 存在的意义：工具（尤其是 read_image / bash）可能跑几分钟，
+    /// 期间若没有任何事件，界面只能一直显示「思考中…」，用户无法判断是死是活。
+    ToolProgress { id: String, name: String, elapsed_secs: u64 },
     /// 工具调用待审批（需分步确认模式）：前端应弹出审批卡片并调用 respond_tool_approval
     ToolApprovalRequired { approval_id: String, id: String, name: String, arguments: String },
     /// 审批结果（前端据此把工具卡片置为执行中/已拒绝）
@@ -160,7 +165,17 @@ pub struct AgentLoopInput {
     pub auto_compress: bool,
     /// 长期记忆协议配置（移植自 dsh-memory-protocol）
     pub memory: crate::ai::memory::MemoryConfig,
+    /// 单个工具调用的最长执行时间（秒）；0 = 不限制。
+    /// 兜底用：任何工具都不该让一整轮 Agent 永久卡死。
+    pub tool_timeout_secs: u64,
 }
+
+/// 单个工具调用的默认上限（秒）。10 分钟足够跑完 OCR / 模型下载 / 长脚本，
+/// 又能在"某个工具真的挂住"时把控制权交还给用户。
+pub const DEFAULT_TOOL_TIMEOUT_SECS: u64 = 600;
+
+/// 工具执行期间的心跳间隔（秒）
+const TOOL_HEARTBEAT_SECS: u64 = 20;
 
 pub struct AgentLoopOutput {
     pub final_content: String,
@@ -856,8 +871,54 @@ where
                 }
             }
 
-            // 真正执行
-            let result = tools.execute(&call_with_parsed_args).await;
+            // ─── 真正执行（带心跳 + 总超时）───
+            // 心跳：每 20s 推一次 ToolProgress，界面能看到"某个工具正在跑、跑了多久"，
+            //       而不是永远停在「思考中…」。
+            // 总超时：任何工具都不该把整轮 Agent 永久卡死（read_image 无超时挂死就是前车之鉴）。
+            let tool_name = call_with_parsed_args.function.name.clone();
+            let tool_id = call_with_parsed_args.id.clone();
+            let started = std::time::Instant::now();
+            let exec_fut = tools.execute(&call_with_parsed_args);
+            tokio::pin!(exec_fut);
+
+            let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(TOOL_HEARTBEAT_SECS));
+            heartbeat.tick().await; // 第一个 tick 立即返回，跳过
+            let timeout_secs = input.tool_timeout_secs.max(1);
+
+            let result = loop {
+                tokio::select! {
+                    r = &mut exec_fut => break Some(r),
+                    _ = heartbeat.tick() => {
+                        let ev = AgentEvent::new(AgentEventKind::ToolProgress {
+                            id: tool_id.clone(),
+                            name: tool_name.clone(),
+                            elapsed_secs: started.elapsed().as_secs(),
+                        });
+                        events.push(ev.clone());
+                        on_event(ev);
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(timeout_secs)) => {
+                        break None;
+                    }
+                }
+            };
+
+            let result = match result {
+                Some(r) => r,
+                None => {
+                    let msg = format!(
+                        "⏱ 工具 {} 超过 {}s 未返回，已被中止（不会继续占用本轮）。\
+                         请换一种方式完成任务：例如先把长任务拆小、检查路径/参数是否正确，\
+                         或先向用户说明卡在哪里。",
+                        tool_name, timeout_secs
+                    );
+                    crate::ai::runtime_log::warn(
+                        "tools",
+                        &format!("工具超时中止：{}（{}s）", tool_name, timeout_secs),
+                    );
+                    ToolResult { success: false, output: msg, data: None }
+                }
+            };
 
             let ev = AgentEvent::new(AgentEventKind::ToolCallExecuted {
                 id: call_with_parsed_args.id.clone(),
@@ -1386,6 +1447,7 @@ fn make_subagent_executor(input: &AgentLoopInput) -> SubagentExecutor {
     let context_limit = input.context_limit;
     let auto_compress = input.auto_compress;
     let memory_cfg = input.memory.clone();
+    let tool_timeout_secs = input.tool_timeout_secs;
     Arc::new(move |instruction: String| -> futures_util::future::BoxFuture<'static, Result<String, String>> {
         let deepseek = deepseek.clone();
         let system_prompt = system_prompt.clone();
@@ -1418,6 +1480,8 @@ fn make_subagent_executor(input: &AgentLoopInput) -> SubagentExecutor {
                 auto_compress,
                 // 子智能体共享同一套长期记忆配置
                 memory: memory_cfg.clone(),
+                // 子智能体沿用主循环的工具超时
+                tool_timeout_secs,
             };
             let output = run_agent_loop(sub_input, |_| {}).await;
             match output {

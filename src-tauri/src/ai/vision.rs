@@ -69,14 +69,36 @@ pub fn get_config() -> VisionConfig {
 
 /// 是否已配置可用的视觉 API
 pub fn is_configured() -> bool {
-    !config_guard().api_key.is_empty()
+    !get_config().api_key.is_empty()
+}
+
+/// 视觉请求超时。
+///
+/// 这里是 **read_image 卡死的根因**：此前用 `reqwest::Client::new()` 建客户端，
+/// 而 `reqwest` 的默认客户端**不带任何超时** —— 视觉端点若不返回（网络卡住、
+/// 模型排队、代理吞连接），这个 await 会永久挂起，Agent 循环随之整轮卡死
+/// （界面上表现为「思考中…」不动、日志停在「调用工具 read_image」）。
+///
+/// 取 180s：OCR / 长文档识图确实可能跑一两分钟，但绝不能无限等。
+const VISION_TIMEOUT_SECS: u64 = 180;
+
+/// 视觉引擎的 HTTP 客户端（带连接超时 + 整体超时）
+fn vision_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .timeout(std::time::Duration::from_secs(VISION_TIMEOUT_SECS))
+        .build()
+        .map_err(|e| format!("Vision HTTP client init failed: {}", e))
 }
 
 /// 识别一张图片，返回结构化文本证据
 pub async fn analyze_image(image_path: &str, prompt: Option<&str>) -> Result<VisionResult, String> {
-    let cfg = config_guard().clone();
+    let cfg = get_config();
     if cfg.api_key.is_empty() {
         return Err("Vision API Key not configured. Set it via 设置 → 视觉识别.".into());
+    }
+    if !cfg.base_url.starts_with("http") {
+        return Err(format!("Vision Base URL 不合法：{}", cfg.base_url));
     }
 
     let bytes = std::fs::read(image_path)
@@ -111,8 +133,8 @@ pub async fn analyze_image(image_path: &str, prompt: Option<&str>) -> Result<Vis
         ]
     });
 
-    let client = reqwest::Client::new();
-    let url = format!("{}/chat/completions", cfg.base_url);
+    let client = vision_client()?;
+    let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
     let resp = client
         .post(&url)
         .header("Authorization", format!("Bearer {}", cfg.api_key))
@@ -120,7 +142,17 @@ pub async fn analyze_image(image_path: &str, prompt: Option<&str>) -> Result<Vis
         .json(&body)
         .send()
         .await
-        .map_err(|e| format!("Vision request failed: {}", e))?;
+        .map_err(|e| {
+            if e.is_timeout() {
+                format!(
+                    "Vision request timed out after {}s（视觉端点无响应：{}）。\
+                     请检查视觉 Base URL / 网络，或在「AI 配置」改用可用的视觉模型。",
+                    VISION_TIMEOUT_SECS, url
+                )
+            } else {
+                format!("Vision request failed ({}): {}", url, e)
+            }
+        })?;
 
     let status = resp.status();
     if !status.is_success() {
@@ -128,10 +160,21 @@ pub async fn analyze_image(image_path: &str, prompt: Option<&str>) -> Result<Vis
         return Err(format!("Vision API error ({}): {}", status, err_body));
     }
 
-    let json: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("Vision parse error: {}", e))?;
+    // 读取响应体同样要有兜底：客户端已设 timeout，这里再包一层，
+    // 保证"读到一半不再有数据"的情况也不会挂住整个 Agent 循环。
+    let raw = tokio::time::timeout(
+        std::time::Duration::from_secs(VISION_TIMEOUT_SECS),
+        resp.text(),
+    )
+    .await
+    .map_err(|_| format!("Vision response body timed out after {}s", VISION_TIMEOUT_SECS))?
+    .map_err(|e| format!("Vision read error: {}", e))?;
+
+    let json: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| {
+            let head: String = raw.chars().take(200).collect();
+            format!("Vision parse error: {}（响应开头：{}）", e, head)
+        })?;
 
     let text = json["choices"][0]["message"]["content"]
         .as_str()

@@ -220,6 +220,8 @@ pub fn clone_for_phase(input: &AgentLoopInput) -> AgentLoopInput {
         auto_compress: input.auto_compress,
         // 长期记忆配置沿用主运行
         memory: input.memory.clone(),
+        // 工具超时沿用主运行（阶段不该比主循环更放任）
+        tool_timeout_secs: input.tool_timeout_secs,
     }
 }
 

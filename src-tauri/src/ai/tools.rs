@@ -22,6 +22,17 @@ fn hide_window(cmd: &mut Command) {
     }
 }
 
+/// 同上，但用于 tokio 异步进程（超时可真杀的那条路径）
+#[cfg(target_os = "windows")]
+fn hide_window_tokio(cmd: &mut tokio::process::Command) {
+    use std::os::windows::process::CommandExt;
+    cmd.creation_flags(CREATE_NO_WINDOW_FLAG);
+}
+
+#[cfg(not(target_os = "windows"))]
+#[allow(dead_code)]
+fn hide_window_tokio(_cmd: &mut tokio::process::Command) {}
+
 use regex::Regex;
 use glob::glob as glob_match;
 
@@ -603,7 +614,12 @@ impl ToolRegistry {
     // ════════════════════════════════════════════════════════
     async fn tool_bash(&self, args: &Value) -> ToolResult {
         let command = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
-        let timeout_ms = args.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(30000);
+        // 默认 5 分钟，可被模型显式指定；夹在 [1s, 30min] 内
+        let timeout_ms = args
+            .get("timeout_ms")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(300_000)
+            .clamp(1_000, 1_800_000);
 
         if command.is_empty() {
             return ToolResult { success: false, output: "command is required".into(), data: None };
@@ -1556,42 +1572,63 @@ async fn run_cmd_with_timeout(command: &str, cwd: &Path, timeout_ms: u64) -> Cmd
     let _ = std::fs::write(&script_path, script_bytes);
 
     let cleanup_path = script_path.clone();
-    let result = tokio::task::spawn_blocking(move || {
+    /*
+     * 真正的超时执行。
+     *
+     * 此前这里是 `spawn_blocking(|| cmd.output())` 外面套 `timeout_ms` —— 但**超时从未生效**：
+     * `spawn_blocking` 里的 `output()` 一旦不返回，`timeout` 只能放弃等待，
+     * **子进程仍在后台跑**（而且它会一直占着线程）。命令挂住时表现为整个 Agent 卡死
+     * （界面上"思考中…"不动），必须手动退出应用。
+     *
+     * 现在改为：tokio 异步进程 + `kill_on_drop`，超时那一刻**真的杀掉子进程**，
+     * 并把已经产出的输出交给模型，让它可以自己判断发生了什么事。
+     */
+    let mut cmd = {
         #[cfg(target_os = "windows")]
-        let output = {
+        {
             let script_str = script_path.to_string_lossy().to_string();
-            let mut cmd = Command::new("cmd");
-            hide_window(&mut cmd);
-            cmd.args(["/D", "/C", script_str.as_str()])
-                .current_dir(&cwd)
-                .env("PYTHONIOENCODING", "utf-8");
-            if let Some(ref py_dir) = python_dir {
-                let existing_path = std::env::var("PATH").unwrap_or_default();
-                cmd.env("PATH", format!("{};{}", py_dir.display(), existing_path));
-            }
-            cmd.output()
-        };
+            let mut c = tokio::process::Command::new("cmd");
+            c.args(["/D", "/C", script_str.as_str()]);
+            c
+        }
         #[cfg(not(target_os = "windows"))]
-        let output = {
-            let mut cmd = Command::new("sh");
-            cmd.arg("-c").arg(&cmd_str).current_dir(&cwd);
-            if let Some(ref py_dir) = python_dir {
-                let existing_path = std::env::var("PATH").unwrap_or_default();
-                cmd.env("PATH", format!("{}:{}", py_dir.display(), existing_path));
-            }
-            cmd.output()
-        };
-        output
-    }).await;
+        {
+            let mut c = tokio::process::Command::new("sh");
+            c.arg("-c").arg(&cmd_str);
+            c
+        }
+    };
+    cmd.current_dir(&cwd)
+        .env("PYTHONIOENCODING", "utf-8")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        // 超时后 Drop 会杀掉整个进程（Windows 上含子进程树）
+        .kill_on_drop(true);
+    if let Some(ref py_dir) = python_dir {
+        let existing_path = std::env::var("PATH").unwrap_or_default();
+        #[cfg(target_os = "windows")]
+        cmd.env("PATH", format!("{};{}", py_dir.display(), existing_path));
+        #[cfg(not(target_os = "windows"))]
+        cmd.env("PATH", format!("{}:{}", py_dir.display(), existing_path));
+    }
+    #[cfg(target_os = "windows")]
+    hide_window_tokio(&mut cmd);
+
+    let out = tokio::time::timeout(
+        std::time::Duration::from_millis(timeout_ms),
+        cmd.output(),
+    )
+    .await;
 
     let _ = std::fs::remove_file(&cleanup_path);
 
-    match result {
-        Ok(Ok(out)) => CmdOutput {
-            success: out.status.success(),
-            stdout: String::from_utf8_lossy(&out.stdout).to_string(),
-            stderr: String::from_utf8_lossy(&out.stderr).to_string(),
-            exit_code: out.status.code().unwrap_or(-1),
+    match out {
+        Ok(Ok(output)) => CmdOutput {
+            success: output.status.success(),
+            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+            exit_code: output.status.code().unwrap_or(-1),
         },
         Ok(Err(e)) => CmdOutput {
             success: false,
@@ -1602,7 +1639,11 @@ async fn run_cmd_with_timeout(command: &str, cwd: &Path, timeout_ms: u64) -> Cmd
         Err(_) => CmdOutput {
             success: false,
             stdout: String::new(),
-            stderr: format!("Command timed out after {}ms", timeout_ms),
+            stderr: format!(
+                "Command timed out after {}ms and was killed. \
+                 若这是长任务，请改成分段执行，或用 timeout_ms 参数显式放宽（上限 30 分钟）。",
+                timeout_ms
+            ),
             exit_code: -1,
         },
     }
@@ -1616,4 +1657,71 @@ fn nanoid_suffix() -> String {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     format!("{}_{}", nanos, std::process::id())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// **回归**：bash 的超时必须**真的杀掉子进程**。
+    ///
+    /// 旧实现是 `spawn_blocking(|| cmd.output())` 外面套 timeout —— 超时只是不再等待，
+    /// 子进程仍在后台跑（且占着线程）。当时的症状：某个命令挂住后整个 Agent 卡死，
+    /// 界面一直「思考中…」，只能手动退出应用。
+    ///
+    /// 这里用一个"睡 6 秒后写文件"的命令：若超时真的杀掉了进程，那个文件永远不会出现。
+    #[tokio::test]
+    async fn bash_timeout_kills_the_process() {
+        let dir = std::env::temp_dir().join(format!("deepahead-tools-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("创建测试目录");
+        let marker = dir.join("should-not-exist.txt");
+        let marker_cmd = marker.to_string_lossy().replace('\\', "/");
+
+        // Windows: ping 当 sleep 用（-n 6 ≈ 5s）；Unix: sleep
+        #[cfg(target_os = "windows")]
+        let cmd = format!("ping -n 6 127.0.0.1 >nul & echo late > \"{}\"", marker_cmd);
+        #[cfg(not(target_os = "windows"))]
+        let cmd = format!("sleep 6; echo late > \"{}\"", marker_cmd);
+
+        let started = Instant::now();
+        let out = run_cmd_with_timeout(&cmd, &dir, 1_000).await;
+        let elapsed = started.elapsed();
+
+        assert!(!out.success, "超时必须是失败结果: {:?}", out.stderr);
+        assert!(
+            out.stderr.contains("timed out"),
+            "应给出超时说明，实际：{}",
+            out.stderr
+        );
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "超时应立即返回，实际耗时 {:?}",
+            elapsed
+        );
+
+        // 关键断言：进程被杀 ⇒ 5 秒后写文件的那一步永远执行不到
+        std::thread::sleep(Duration::from_secs(6));
+        assert!(
+            !marker.exists(),
+            "超时后子进程仍在运行（标记文件被写出）：{}",
+            marker.display()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 正常命令必须照常返回（超时逻辑不能误伤）
+    #[tokio::test]
+    async fn bash_normal_command_still_works() {
+        let dir = std::env::temp_dir();
+        let out = run_cmd_with_timeout("echo deepahead-ok", &dir, 30_000).await;
+        assert!(out.success, "普通命令应成功，stderr={}", out.stderr);
+        assert!(
+            out.stdout.contains("deepahead-ok"),
+            "应拿到命令输出，实际：{}",
+            out.stdout
+        );
+    }
 }

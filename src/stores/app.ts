@@ -235,6 +235,8 @@ export const useAppStore = defineStore("app", () => {
     success?: boolean;
     output?: string;
     status: "pending" | "awaiting" | "running" | "done" | "error";
+    /** 后端心跳上报的已执行秒数（tool_progress 事件） */
+    elapsedSecs?: number;
   }>>([]);
   const agentIterations = ref(0);
   const agentMaxIterations = ref(0);
@@ -578,6 +580,19 @@ export const useAppStore = defineStore("app", () => {
               pendingApproval.value = null;
             }
             appendLog("tool", k.approved ? "✅ 已批准执行" : "⛔ 用户拒绝执行");
+          } else if (k.type === "tool_progress") {
+            // 工具执行心跳：后端每 ~20s 报一次，避免长时间"思考中…"看起来像卡死
+            const t = toolCalls.value.find(t => t.id === k.id);
+            const secs = Number(k.elapsed_secs || 0);
+            if (t) {
+              t.status = "running";
+              t.elapsedSecs = secs;
+            }
+            appendLog(
+              "tool",
+              `⏳ ${k.name} 仍在执行（${secs}s）`,
+              "长任务属正常；若长时间无进展可点日志里的工具条目查看参数。"
+            );
           } else if (k.type === "tool_call_executed") {
             const tc = toolCalls.value.find(t => t.id === k.id);
             if (tc) {

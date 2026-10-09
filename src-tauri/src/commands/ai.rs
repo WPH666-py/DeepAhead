@@ -347,6 +347,9 @@ pub async fn send_ai_message_with_tools(
         context_limit: effective_limit,
         auto_compress: effective_auto_compress,
         memory: crate::ai::memory::get_config(),
+        // 单个工具调用的上限：任何工具都不该让整轮 Agent 永久卡死
+        // （read_image 曾经因为视觉请求没有超时而挂死一整轮）
+        tool_timeout_secs: crate::ai::agent_loop::DEFAULT_TOOL_TIMEOUT_SECS,
     };
 
     // 事件转发到 Tauri：每个 agent 事件触发 ai-agent-event
