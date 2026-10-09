@@ -280,6 +280,29 @@ pub fn classify_tool(name: &str) -> ToolClass {
     ToolClass::Unknown
 }
 
+/// 是否属于需要用户逐项确认的**风险操作**。
+///
+/// 用于「仅确认风险操作」档位：只有这里判定为 true 的调用才会弹审批卡片，
+/// 只读 / 分析类调用直接放行，不被无谓打扰。
+pub fn is_risk_operation(tool: &str, _args: &serde_json::Value) -> bool {
+    let by_class = match classify_tool(tool) {
+        // 变更类与未知类一律视为风险
+        ToolClass::Mutating | ToolClass::Unknown => true,
+        // 分析类里只有少数带外发副作用的算风险
+        ToolClass::Analysis => matches!(tool, "web_fetch" | "web_search"),
+        ToolClass::Artifact => matches!(
+            tool,
+            "create_goal" | "update_goal" | "send_message" | "install_python_package"
+        ),
+    };
+    if by_class {
+        return true;
+    }
+    // 形似命令 / 推代码 / 删盘的工具名兜底（含 MCP 前缀工具）
+    let n = tool.to_lowercase();
+    n.starts_with("git_") || n.starts_with("terminal_") || n.starts_with("mcp__")
+}
+
 // ════════════════════════════════════════════════════════
 // 只读命令判定
 // ════════════════════════════════════════════════════════
@@ -839,6 +862,37 @@ pub fn set_ui_toggles(turn_card_enabled: Option<bool>, task_contract_enabled: Op
     if let Ok(mut g) = config_lock().lock() {
         *g = cfg.clone();
     }
+    audit(
+        "mode-link",
+        "__ui",
+        "-",
+        &format!(
+            "规则引擎开关 → 引擎 {}｜裁决卡片 {}｜任务契约 {}",
+            if cfg.enabled { "开" } else { "关" },
+            if cfg.turn_card_enabled { "开" } else { "关" },
+            if cfg.task_contract_enabled { "开" } else { "关" },
+        ),
+        "",
+    );
+    cfg
+}
+
+/// **执行许可档位 → 规则引擎开关**的唯一联动入口。
+///
+/// 规则引擎的开关**不交给用户自选**，而是由执行许可档位唯一决定：
+///   - `需逐步确认`：规则引擎所有开关全开（硬门 + 裁决卡片 + 任务契约），
+///     每一步工具调用都要查看；
+///   - `仅确认风险操作`：规则引擎所有开关全开（硬门 + 裁决卡片 + 任务契约），
+///     只有风险操作才会弹卡片；
+///   - `全流程开放`：规则引擎所有开关**全关**，所有操作**永久放行**
+///     （不产生硬门、不产生裁决卡片）。
+pub fn link_ui_mode(mode: &crate::ai::approval::ApprovalMode) -> RuleEngineConfig {
+    let on = mode.rule_engine_enabled();
+    let cfg = set_ui_toggles(Some(mode.turn_card_enabled()), Some(on), Some(on));
+    crate::ai::runtime_log::info(
+        "rules",
+        &format!("执行许可 → {}；规则引擎配置：{}", mode.label(), mode.describe()),
+    );
     cfg
 }
 

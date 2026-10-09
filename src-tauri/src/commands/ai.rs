@@ -253,6 +253,9 @@ pub async fn send_ai_message_with_tools(
     approval_mode: Option<String>,
     context_limit: Option<usize>,
     auto_compress: Option<bool>,
+    // 续跑上下文：用户在裁决卡片上选择 ❌ 放行后，前端自动回「继续」时携带。
+    // 形如 {"run_id":"...","tool":"write","op_type":"write","path":"D:\\a.txt"}。
+    resume_context: Option<serde_json::Value>,
     ds_client: State<'_, DeepSeekClient>,
     undo_store: State<'_, UndoStore>,
     approval_gate: State<'_, Arc<ApprovalGate>>,
@@ -271,6 +274,34 @@ pub async fn send_ai_message_with_tools(
         })
         .collect();
     let system_prompt = build_system_prompt(&mode, &context_files);
+    // 续跑：把"用户已放行、请立即执行"作为额外前言注入（模型据此直接动手，不再请示）
+    let extra_preamble = resume_context.as_ref().and_then(|rc| {
+        let tool = rc.get("tool").and_then(|v| v.as_str()).unwrap_or("");
+        if tool.is_empty() {
+            return None;
+        }
+        let path = rc.get("path").and_then(|v| v.as_str()).unwrap_or("");
+        let args = rc.get("args").and_then(|v| v.as_str()).unwrap_or("");
+        Some(format!(
+            "## 续跑（用户在裁决卡片上选择了 ❌ 放行）\n\
+             用户刚刚在裁决卡片上放行了下面这个操作，规则引擎已登记一次性放行：\n\
+             - 工具：`{}`\n\
+             - 参数：`{}`\n\
+             - 路径/类型：{} / {}\n\
+             **请立即重新发起这同一个调用**（工具名与参数保持一致，便于消费一次性放行），\
+             不需要再向用户确认；放行成功后继续完成原任务。若该操作已经不再必要，直接说明原因并给出结论。",
+            tool,
+            if args.chars().count() > 400 { args.chars().take(400).collect::<String>() } else { args.to_string() },
+            if path.is_empty() { "（不适用）" } else { path },
+            rc.get("op_type").and_then(|v| v.as_str()).unwrap_or("any"),
+        ))
+    });
+    if let Some(extra) = &extra_preamble {
+        crate::ai::runtime_log::info(
+            "agent",
+            &format!("续跑注入：{}", extra.replace('\n', " ").chars().take(200).collect::<String>()),
+        );
+    }
 
     // DeepSeekClient 本身可 Clone（内部 Arc 共享配置），这里 clone 一份独立的 owned 实例
     // 给 agent_loop 使用，避免 State 生命周期问题
@@ -286,6 +317,19 @@ pub async fn send_ai_message_with_tools(
     let effective_limit = context_limit.unwrap_or(DEFAULT_CONTEXT_LIMIT).max(1000);
     let effective_auto_compress = auto_compress.unwrap_or(false);
 
+    let parsed_mode = ApprovalMode::parse(&approval_mode.unwrap_or_else(|| "step".to_string()));
+    crate::ai::runtime_log::info(
+        "agent",
+        &format!(
+            "收到用户消息 run={} 模式={} 执行许可={} 工具={} 工作目录={}",
+            run_id,
+            mode.to_uppercase(),
+            parsed_mode.describe(),
+            if message.starts_with("[System]") { "对话" } else { "Agent" },
+            wd.display()
+        ),
+    );
+
     let input = AgentLoopInput {
         mode: mode.clone(),
         user_message: message,
@@ -297,8 +341,8 @@ pub async fn send_ai_message_with_tools(
         run_id: run_id.clone(),
         undo_store: Arc::new(undo_store.inner().clone()),
         max_iterations_override: None,
-        extra_preamble: None,
-        approval_mode: ApprovalMode::parse(&approval_mode.unwrap_or_else(|| "step".to_string())),
+        extra_preamble,
+        approval_mode: parsed_mode,
         approval_gate: gate_arc,
         context_limit: effective_limit,
         auto_compress: effective_auto_compress,
@@ -741,7 +785,124 @@ pub fn rules_guard_command(input: String) -> serde_json::Value {
     let r = crate::ai::rules_engine::run_guard_command(&mut cfg, &mut st, &input);
     // unlock / bypass 等运行期窗口写回全局，下一次 Agent 运行即刻生效
     crate::ai::rules_engine::apply_runtime_windows(cfg.unlock_until, cfg.bypass_until);
+    crate::ai::runtime_log::info("rules", &format!("/guard {} → {}", input.trim(), r.text.trim()));
     serde_json::to_value(r).unwrap_or(serde_json::json!({"ok": false, "text": "命令执行失败"}))
+}
+
+/// **执行许可档位 → 规则引擎开关联动**（规则引擎的开关不交给用户自选）
+///
+/// - 需逐步确认 / 仅确认风险操作：规则引擎所有开关全开（硬门 + 裁决卡片 + 任务契约）；
+/// - 全流程开放：规则引擎所有开关**全关**，所有操作**永久放行**。
+#[tauri::command]
+pub fn rules_link_mode(mode: String) -> serde_json::Value {
+    let m = crate::ai::approval::ApprovalMode::parse(&mode);
+    let cfg = crate::ai::rules_engine::link_ui_mode(&m);
+    serde_json::json!({
+        "mode": m.as_str(),
+        "label": m.label(),
+        "rule_engine_on": m.rule_engine_enabled(),
+        "turn_card_on": m.turn_card_enabled(),
+        "gate_every_call": m.gate_every_call(),
+        "config": serde_json::to_value(cfg).unwrap_or(serde_json::json!({})),
+    })
+}
+
+/// ─── 回合裁决卡片 → 放行 / 拦截（待决规则裁决队列）───
+
+/// 用户在卡片上做出选择：
+/// - `approved = true`（❌ 放行）：登记一次性放行并置「待继续」，前端自动回「继续」；
+/// - `approved = false`（✅ 拦截）：不放行，本轮不再重试该操作。
+#[tauri::command]
+pub fn rules_resolve_pending(
+    run_id: String,
+    block_index: usize,
+    approved: bool,
+) -> Result<serde_json::Value, String> {
+    let op = crate::ai::pending_guard::resolve(&run_id, block_index, approved)?;
+    let mut v = serde_json::to_value(&op).map_err(|e| e.to_string())?;
+    v["has_continue"] = serde_json::json!(crate::ai::pending_guard::has_continue(&run_id));
+    Ok(v)
+}
+
+/// 读取「待继续」状态（Agent 跑完后前端调用一次：需要则自动回「继续」再跑一轮）
+#[tauri::command]
+pub fn rules_take_continue(run_id: String) -> serde_json::Value {
+    let cont = crate::ai::pending_guard::take_continue(&run_id);
+    let op = if cont {
+        crate::ai::pending_guard::take_last_allowed(&run_id)
+    } else {
+        None
+    };
+    serde_json::json!({
+        "has_continue": cont,
+        "op": serde_json::to_value(op).unwrap_or(serde_json::Value::Null),
+    })
+}
+
+/// 待决裁决队列状态（只读，供界面显示）
+#[tauri::command]
+pub fn rules_pending_state(run_id: String) -> serde_json::Value {
+    crate::ai::pending_guard::snapshot(&run_id)
+}
+
+/// 试算一次工具调用是否属于「风险操作」（仅确认风险操作档位的判定口径）
+#[tauri::command]
+pub fn rules_is_risk(tool: String, arguments: Option<serde_json::Value>) -> serde_json::Value {
+    let args = arguments.unwrap_or(serde_json::json!({}));
+    serde_json::json!({ "risk": crate::ai::rules_engine::is_risk_operation(&tool, &args) })
+}
+
+/// ════════════════════════════════════════════════════════
+/// 运行时日志（实时落盘到用户本机安装目录，用户随时可查）
+/// ════════════════════════════════════════════════════════
+
+/// 前端日志面板的每条记录都实时落盘（level: info / warn / error）
+#[tauri::command]
+pub fn runtime_log_write(level: String, scope: String, message: String) -> bool {
+    let lv = match level.as_str() {
+        "warn" | "warning" => "warn",
+        "error" | "fatal" => "error",
+        _ => "info",
+    };
+    crate::ai::runtime_log::write(lv, &scope, &message);
+    true
+}
+
+/// 日志文件位置与体积（界面显示"日志已实时保存到 …"）
+#[tauri::command]
+pub fn runtime_log_status() -> serde_json::Value {
+    crate::ai::runtime_log::status()
+}
+
+/// 磁盘日志尾部（界面内直接查看，不必离开应用）
+#[tauri::command]
+pub fn runtime_log_tail(lines: Option<usize>) -> serde_json::Value {
+    let n = lines.unwrap_or(200).clamp(10, 5000);
+    serde_json::json!({
+        "text": crate::ai::runtime_log::tail(n),
+        "path": crate::ai::runtime_log::log_path().to_string_lossy().to_string(),
+    })
+}
+
+/// 在系统文件管理器中打开日志目录（安装目录下的 DeepAhead\logs）
+#[tauri::command]
+pub fn runtime_log_open_dir() -> Result<String, String> {
+    let dir = crate::ai::runtime_log::log_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建日志目录失败: {}", e))?;
+    let path = dir.to_string_lossy().to_string();
+    #[cfg(target_os = "windows")]
+    let spawned = std::process::Command::new("explorer").arg(&path).spawn();
+    #[cfg(target_os = "macos")]
+    let spawned = std::process::Command::new("open").arg(&path).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let spawned = std::process::Command::new("xdg-open").arg(&path).spawn();
+    match spawned {
+        Ok(_) => {
+            crate::ai::runtime_log::info("app", &format!("已在文件管理器中打开日志目录：{}", path));
+            Ok(path)
+        }
+        Err(e) => Err(format!("打开日志目录失败：{}（目录：{}）", e, path)),
+    }
 }
 
 /// 回合裁决卡片列表

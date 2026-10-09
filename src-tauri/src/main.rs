@@ -74,11 +74,23 @@ fn main() {
             commands::rules_attach_turn_card,
             commands::rules_labels,
             commands::rules_fingerprint,
+            // 执行许可档位 ↔ 规则引擎开关联动（开关不交给用户自选）
+            commands::rules_link_mode,
+            commands::rules_is_risk,
+            // 回合裁决卡片：❌ 放行 → 一次性放行 → 自动「继续」
+            commands::rules_resolve_pending,
+            commands::rules_take_continue,
+            commands::rules_pending_state,
+            // 运行时日志（实时落盘到用户本机安装目录）
+            commands::runtime_log_write,
+            commands::runtime_log_status,
+            commands::runtime_log_tail,
+            commands::runtime_log_open_dir,
             // 费用统计（dsh-cost-meter 移植）
             commands::cost_snapshot,
             commands::cost_set_config,
             commands::cost_clear,
-            // 执行许可（需分步确认 / 全流程开放）
+            // 执行许可（需逐步确认 / 仅确认风险操作 / 全流程开放）
             commands::respond_tool_approval,
             // Agent + 安全
             commands::list_agents,

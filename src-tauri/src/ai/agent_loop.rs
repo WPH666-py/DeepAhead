@@ -214,6 +214,17 @@ where
         &mut on_event,
     );
 
+    crate::ai::runtime_log::info(
+        "agent",
+        &format!(
+            "Agent 循环开始 run={} mode={} 工作目录={} 执行许可={}",
+            input.run_id,
+            input.mode.to_uppercase(),
+            input.working_dir.display(),
+            input.approval_mode.describe()
+        ),
+    );
+
     // 1. 使用命令层组装好的原生 System Prompt（模式基础提示 + 上下文文件内容；
     //    工作流编排内容由引擎经 extra_preamble 注入）
     let mut system_prompt = input.system_prompt.clone();
@@ -336,7 +347,11 @@ where
     rule_state.user_text = input.user_message.clone();
     rule_state.has_execute_clause = crate::ai::rules_engine::has_execute_clause(&input.user_message);
     let rule_cfg = crate::ai::rules_engine::get_config();
-    let guard_enabled = rule_cfg.enabled;
+    // 执行许可档位是规则引擎的总闸：
+    //   - 需逐步确认 / 仅确认风险操作 → 规则引擎全开（硬门 + 裁决卡片）
+    //   - 全流程开放 → 规则引擎所有开关全关，所有操作**永久放行**
+    let guard_enabled = rule_cfg.enabled && input.approval_mode.rule_engine_enabled();
+    let turn_card_on = rule_cfg.turn_card_enabled && input.approval_mode.turn_card_enabled();
     // 把界面设置的 unlock / bypass 窗口同步给本次运行（运行期可被 /guard 改动）
     let mut rule_cfg = rule_cfg;
     rule_cfg.unlock_until = rule_cfg.unlock_until.max(0);
@@ -525,6 +540,16 @@ where
         if tool_calls.is_empty() {
             // 没有工具调用 = 任务完成
             cleanup_temp_py_files(&input.working_dir, &existing_temp_files);
+            crate::ai::runtime_log::info(
+                "agent",
+                &format!(
+                    "Agent 循环结束 run={} 步数={} 工具调用={} 被拦={}",
+                    input.run_id,
+                    iter + 1,
+                    total_tool_calls,
+                    turn_blocks.len()
+                ),
+            );
             let ev = AgentEvent::new(AgentEventKind::Done {
                 content: final_content.clone(),
                 total_iterations: iter + 1,
@@ -534,7 +559,7 @@ where
             events.push(ev.clone());
             on_event(ev);
             memory_auto_ingest(&input.memory, &input.run_id, &input.user_message, &final_content);
-            emit_turn_card(&rule_cfg, &input.run_id, &input.user_message, &turn_blocks, &mut on_event, &mut events);
+            emit_turn_card(turn_card_on, &input.run_id, &input.user_message, &turn_blocks, &mut on_event, &mut events);
             emit_text_audit(&rule_cfg, &input.user_message, &final_content, &mut audit_state, &mut on_event, &mut events);
             cost_record(
                 &input.mode, &input.run_id,
@@ -609,15 +634,35 @@ where
 
             // ─── 规则引擎硬门（移植自 dsh-rule-engine）───
             // 与上游一致：拒绝发生在工具执行之前，理由写明补救动作，并记入审计账本。
+            // 用户在裁决卡片上选择 ❌ 放行后，同一次调用会命中一次性放行，直接通过。
             if guard_enabled {
                 let now = chrono::Utc::now().timestamp();
-                let decision = crate::ai::rules_engine::guard_decision(
-                    &rule_cfg,
-                    &mut rule_state,
+                let (op_type, op_path) = crate::ai::rules_engine::operation_of(
                     &call_with_parsed_args.function.name,
                     &call_with_parsed_args.function.arguments,
-                    now,
                 );
+                let pre_approved = crate::ai::pending_guard::consume_allow(
+                    &call_with_parsed_args.function.name,
+                    &op_type,
+                    &op_path,
+                );
+                let decision = if pre_approved {
+                    crate::ai::rules_engine::GuardDecision {
+                        allow: true,
+                        rule_id: "__card-allow".into(),
+                        kind: "card-allow".into(),
+                        reason: "用户在回合裁决卡片上放行（❌），一次性放行已消费".into(),
+                        err_id: String::new(),
+                    }
+                } else {
+                    crate::ai::rules_engine::guard_decision(
+                        &rule_cfg,
+                        &mut rule_state,
+                        &call_with_parsed_args.function.name,
+                        &call_with_parsed_args.function.arguments,
+                        now,
+                    )
+                };
                 crate::ai::rules_engine::audit(
                     if decision.allow { "allow" } else { "deny" },
                     &decision.rule_id,
@@ -626,14 +671,36 @@ where
                     &decision.err_id,
                 );
                 if !decision.allow {
-                    // 记入回合裁决卡片（每条独立可判）
+                    // 登记待决记录：前端出卡片，用户 ❌ 放行 / ✅ 拦截
+                    let block_index = turn_blocks.len();
+                    crate::ai::pending_guard::record(
+                        &input.run_id,
+                        block_index,
+                        &call_with_parsed_args.function.name,
+                        &op_type,
+                        &op_path,
+                        &call_with_parsed_args.function.arguments.to_string(),
+                        &decision.reason,
+                        &decision.err_id,
+                    );
                     turn_blocks.push(crate::ai::rules_engine::make_card_block(
-                        turn_blocks.len(),
+                        block_index,
                         &call_with_parsed_args.function.name,
                         &call_with_parsed_args.function.arguments,
                         &decision,
                         &format!("工具 {} 被规则 {} 拦下", call_with_parsed_args.function.name, decision.rule_id),
                     ));
+                    crate::ai::runtime_log::info(
+                        "rules",
+                        &format!(
+                            "硬门拦下 run={} #{} tool={} 规则={}：{}",
+                            input.run_id,
+                            block_index,
+                            call_with_parsed_args.function.name,
+                            decision.rule_id,
+                            decision.reason
+                        ),
+                    );
                     let reason = decision.reason.clone();
                     messages.push(tool_result_message(
                         &call_with_parsed_args.id,
@@ -725,8 +792,19 @@ where
                 }
             }
 
-            // ─── 执行许可门（需分步确认 / 全流程开放，对标 Harness 审批）───
-            if input.approval_mode == ApprovalMode::StepConfirm {
+            // ─── 执行许可门（三档：需逐步确认 / 仅确认风险操作 / 全流程开放）───
+            // 需逐步确认：每一个工具调用都要看一眼；
+            // 仅确认风险操作：只有风险操作（变更类 / 未知类 / 外发类）才要确认；
+            // 全流程开放：直接放行（规则引擎同步全关，所有操作永久放行）。
+            let needs_confirm = match input.approval_mode {
+                ApprovalMode::FullOpen => false,
+                ApprovalMode::StepConfirm => true,
+                ApprovalMode::RiskOnly => crate::ai::rules_engine::is_risk_operation(
+                    &call_with_parsed_args.function.name,
+                    &call_with_parsed_args.function.arguments,
+                ),
+            };
+            if needs_confirm {
                 let approval_id = format!("ap_{}_{}", input.run_id, total_tool_calls);
                 let args_str = call_with_parsed_args.function.arguments.to_string();
                 let allowed = input
@@ -739,11 +817,11 @@ where
                         input.approval_mode,
                     )
                     .await?;
-                // 通知前端状态流转（执行中 / 已拒绝）
+                // 通知前端状态流转（执行中 / 已拦截）
                 let resolved = if allowed {
-                    "✅ 用户已批准，开始执行".to_string()
+                    "❌ 放行该操作，自动回复「继续」，Agent 继续跑".to_string()
                 } else {
-                    "⛔ 用户拒绝执行该工具调用".to_string()
+                    "✅ 拦截该操作（Agent 换方案或先向用户确认）".to_string()
                 };
                 let ev = AgentEvent::new(AgentEventKind::ToolApprovalResolved {
                     id: call_with_parsed_args.id.clone(),
@@ -754,10 +832,13 @@ where
                 on_event(ev);
 
                 if !allowed {
-                    // 拒绝：以工具失败结果回灌，让模型换方案或与用户确认
-                    let msg = "⛔ 用户拒绝执行该工具调用（需分步确认模式）。\
-                               请改用不需要该工具的方案继续，或先向用户确认后再调用。"
-                        .to_string();
+                    // 拦截：以工具失败结果回灌，让模型换方案或与用户确认
+                    let msg = format!(
+                        "✅ 用户拦截了该工具调用（{}）。\
+                         请不要用同样的参数重试；改用不需要该操作的方案继续，\
+                         或先向用户说明你打算做什么并征得同意。",
+                        input.approval_mode.label()
+                    );
                     messages.push(tool_result_message(
                         &call_with_parsed_args.id,
                         &call_with_parsed_args.function.name,
@@ -823,8 +904,28 @@ where
     on_event(ev);
 
     memory_auto_ingest(&input.memory, &input.run_id, &input.user_message, &final_content);
-    emit_turn_card(&rule_cfg, &input.run_id, &input.user_message, &turn_blocks, &mut on_event, &mut events);
+    emit_turn_card(turn_card_on, &input.run_id, &input.user_message, &turn_blocks, &mut on_event, &mut events);
     emit_text_audit(&rule_cfg, &input.user_message, &final_content, &mut audit_state, &mut on_event, &mut events);
+    crate::ai::runtime_log::info(
+        "agent",
+        &format!(
+            "Agent 循环达到最大迭代 run={} 步数={} 工具调用={} 被拦={}",
+            input.run_id,
+            config.max_iterations,
+            total_tool_calls,
+            turn_blocks.len()
+        ),
+    );
+    // 正常收尾：清理本轮的待决裁决记录（一次性放行仍保留，供续跑消费）
+    if !turn_blocks.is_empty() {
+        crate::ai::runtime_log::info(
+            "rules",
+            &format!(
+                "本轮共 {} 条被拦记录；待用户在裁决卡片上选择 ❌ 放行 / ✅ 拦截（放行将自动回复「继续」）",
+                turn_blocks.len()
+            ),
+        );
+    }
     cost_record(
         &input.mode, &input.run_id,
         cost_input, cost_output, cost_cache_hit, cost_cache_miss, cost_reasoning,
@@ -893,27 +994,37 @@ fn emit_text_audit(
 }
 
 /// 回合末生成裁决卡片（对齐 dsh-rule-engine-client：一条被拦记录都没有时不产生卡片）。
-/// 默认关闭（`turn_card_enabled = false`），与上游"面向大众默认关"一致。
+/// 是否产生由**执行许可档位**决定（`全流程开放` 档位不产生卡片）。
 fn emit_turn_card(
-    cfg: &crate::ai::rules_engine::RuleEngineConfig,
+    turn_card_on: bool,
     session_id: &str,
     user_message: &str,
     blocks: &[crate::ai::rules_engine::TurnCardBlock],
     on_event: &mut dyn FnMut(AgentEvent),
     events: &mut Vec<AgentEvent>,
 ) {
-    if !cfg.turn_card_enabled || blocks.is_empty() {
+    if !turn_card_on || blocks.is_empty() {
         return;
     }
     match crate::ai::rules_engine::record_turn_card(session_id, 1, user_message, blocks.to_vec()) {
         Ok(card) => {
+            crate::ai::runtime_log::info(
+                "rules",
+                &format!(
+                    "回合裁决卡片已生成 key={} 共 {} 条被拦记录（用户在卡片上选择 ❌ 放行 / ✅ 拦截）",
+                    card.key,
+                    card.blocks.len()
+                ),
+            );
             if let Ok(v) = serde_json::to_value(&card) {
                 let ev = AgentEvent::new(AgentEventKind::TurnCard { card: v });
                 events.push(ev.clone());
                 on_event(ev);
             }
         }
-        Err(_) => { /* 卡片落盘失败不能影响主流程 */ }
+        Err(e) => {
+            crate::ai::runtime_log::warn("rules", &format!("裁决卡片落盘失败（不影响主流程）：{}", e));
+        }
     }
 }
 

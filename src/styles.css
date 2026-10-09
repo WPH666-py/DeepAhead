@@ -705,34 +705,117 @@ body {
 }
 
 /* ========== 自动更新弹框 ========== */
-.update-modal .modal-box { width: 560px; }
+.update-modal .modal-box {
+    width: 580px; max-width: 94vw; overflow: hidden;
+    border-radius: 14px; box-shadow: 0 20px 60px rgba(15, 30, 60, 0.22);
+}
+
+/* 顶部渐变 hero：把"有新版本"这件事一眼讲清 */
+.update-hero {
+    position: relative; display: flex; align-items: center; gap: 0.75rem;
+    padding: 1.1rem 1.2rem 1.15rem;
+    background: linear-gradient(135deg, #1a73e8 0%, #4f8ef7 45%, #6aa9ff 100%);
+    color: #fff;
+}
+.update-hero::after {
+    content: ''; position: absolute; inset: 0;
+    background: radial-gradient(circle at 88% 12%, rgba(255,255,255,0.28), transparent 55%);
+    pointer-events: none;
+}
+.update-hero-icon {
+    flex-shrink: 0; width: 46px; height: 46px; border-radius: 13px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 1.5rem; background: rgba(255,255,255,0.18);
+    border: 1px solid rgba(255,255,255,0.3);
+}
+.update-hero-text { flex: 1; min-width: 0; }
+.update-hero-title { font-size: 1.06rem; font-weight: 700; letter-spacing: 0.3px; }
+.update-hero-sub { font-size: 0.73rem; opacity: 0.88; margin-top: 0.15rem; }
+.update-hero-close {
+    position: absolute; top: 0.65rem; right: 0.7rem; z-index: 1;
+    width: 26px; height: 26px; border-radius: 50%; border: none; cursor: pointer;
+    background: rgba(255,255,255,0.16); color: #fff; font-size: 1.05rem; line-height: 1;
+    display: flex; align-items: center; justify-content: center;
+}
+.update-hero-close:hover { background: rgba(255,255,255,0.32); }
+
+.update-body { padding: 1.05rem 1.2rem 0.4rem; }
+
+/* 版本跃迁：左右两张 chip + 中间箭头 */
 .update-versions {
-    display: flex; align-items: baseline; gap: 0.6rem; margin-bottom: 0.6rem;
-    font-size: 0.9rem;
+    display: flex; align-items: center; justify-content: center;
+    gap: 0.7rem; margin-bottom: 0.85rem;
 }
-.update-cur { color: #8a919f; font-family: 'Cascadia Code','Consolas',monospace; }
-.update-arrow { color: #b8bfc6; }
-.update-new {
-    color: #067647; font-weight: 700;
-    font-family: 'Cascadia Code','Consolas',monospace; font-size: 1.05rem;
+.update-ver-chip {
+    flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 0.12rem;
+    padding: 0.5rem 0.7rem; border-radius: 10px; border: 1px solid #e6e9ec;
+    background: #fafbfd;
 }
-.update-asset { font-size: 0.78rem; color: #4e5969; margin-bottom: 0.2rem; }
-.update-asset code { font-family: 'Cascadia Code','Consolas',monospace; }
-.update-date { font-size: 0.72rem; color: #a8afb8; margin-bottom: 0.6rem; }
-.update-progress { margin: 0.6rem 0; }
-.update-progress-label { font-size: 0.76rem; color: #4e5969; margin-bottom: 0.3rem; }
-.update-notes { margin-top: 0.6rem; }
-.update-notes-title { font-size: 0.76rem; color: #8a919f; margin-bottom: 0.25rem; }
+.update-ver-chip.new {
+    border-color: #b7e3c4; background: linear-gradient(180deg, #f2fbf5, #e8f7ef);
+}
+.update-ver-label { font-size: 0.66rem; color: #8a919f; }
+.update-ver-num {
+    font-family: 'Cascadia Code','Consolas',monospace; font-size: 1.02rem;
+    font-weight: 700; color: #4e5969; overflow: hidden; text-overflow: ellipsis;
+}
+.update-ver-chip.new .update-ver-num { color: #067647; }
+.update-arrow { flex-shrink: 0; color: #b8bfc6; font-size: 1.1rem; }
+
+/* 元信息 chips */
+.update-meta { display: flex; flex-wrap: wrap; gap: 0.35rem; margin-bottom: 0.7rem; }
+.update-chip {
+    font-size: 0.69rem; color: #55606b; background: #f2f5f8;
+    border: 1px solid #e4e9ee; border-radius: 999px; padding: 0.14rem 0.55rem;
+    max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.update-chip.ok { color: #067647; background: #eefaf2; border-color: #c6e9d3; }
+
+/* 进度 */
+.update-progress { margin: 0.7rem 0 0.2rem; }
+.update-progress-head {
+    display: flex; align-items: baseline; justify-content: space-between;
+    font-size: 0.76rem; color: #4e5969; margin-bottom: 0.35rem;
+}
+.update-progress-phase { font-weight: 600; }
+.update-progress-pct {
+    font-family: 'Cascadia Code','Consolas',monospace;
+    font-size: 0.8rem; font-weight: 700; color: #1a73e8;
+}
+.update-progress-bar {
+    height: 7px; border-radius: 4px; background: #eceff3; overflow: hidden;
+}
+.update-progress-fill {
+    height: 100%; border-radius: 4px; transition: width 0.25s ease;
+    background: linear-gradient(90deg, #1a73e8, #6aa9ff);
+}
+.update-progress-fill.installing {
+    background: linear-gradient(90deg, #067647, #4bbf7a);
+    animation: update-pulse 1.2s ease-in-out infinite;
+}
+@keyframes update-pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.55; } }
+.update-progress-note { font-size: 0.7rem; color: #8a919f; margin-top: 0.35rem; line-height: 1.5; }
+
+.update-notes { margin-top: 0.75rem; }
+.update-notes-title { font-size: 0.76rem; color: #4e5969; font-weight: 600; margin-bottom: 0.3rem; }
 .update-notes-body {
-    margin: 0; padding: 0.55rem 0.65rem; background: #f7f8fa; border: 1px solid #e6e9ec;
-    border-radius: 6px; font-size: 0.72rem; line-height: 1.55; color: #444;
+    margin: 0; padding: 0.6rem 0.7rem; background: #f8f9fb; border: 1px solid #e8ebef;
+    border-radius: 8px; font-size: 0.72rem; line-height: 1.6; color: #444;
     white-space: pre-wrap; overflow-wrap: anywhere; max-height: 220px; overflow-y: auto;
 }
 .update-hint {
     margin-top: 0.7rem; padding: 0.45rem 0.6rem; background: #f6f9fc;
-    border: 1px solid #e2ecf5; border-radius: 6px;
+    border: 1px solid #e2ecf5; border-radius: 8px;
     font-size: 0.72rem; line-height: 1.6; color: #55606b;
 }
+
+/* 底部按钮区 */
+.update-actions {
+    display: flex; gap: 0.6rem; justify-content: flex-end;
+    padding: 0.9rem 1.2rem 1.1rem; border-top: 1px solid #f0f2f5; background: #fcfdfe;
+}
+.update-actions .btn { min-width: 108px; }
+.update-go { box-shadow: 0 2px 10px rgba(26,115,232,0.28); }
 .agent-tool-header {
     display: flex; align-items: center; gap: 6px; cursor: pointer;
     padding: 3px 6px; border-radius: 3px; flex-wrap: nowrap;
@@ -1096,3 +1179,153 @@ body {
 .ai-context-stats {
     margin-left: auto; font-size: 0.7rem; color: #999; white-space: nowrap;
 }
+
+/* ══════════════════════════════════════════════════════════════════
+   v0.5.5 视觉刷新：Deepseek-API 运行时 / 执行许可三档 / 规则引擎开关 /
+   日志实时落盘。统一圆角、间距、层次与状态色，提升可读性与审美。
+   ══════════════════════════════════════════════════════════════════ */
+
+/* ─── AI 配置弹窗：更宽的呼吸感 + 层次标题 ─── */
+.modal-box { border-radius: 14px; box-shadow: 0 18px 50px rgba(16, 24, 40, 0.18); }
+.modal-header { border-bottom: 1px solid #f0f2f5; }
+.modal-header h3 { font-weight: 600; letter-spacing: 0.2px; }
+.modal-body { padding: 1.25rem 1.4rem 1.4rem; }
+
+.config-lead {
+    font-size: 0.78rem; line-height: 1.75; color: #6b7280; margin-bottom: 1rem;
+    background: linear-gradient(180deg, #f8fafc, #ffffff);
+    border: 1px solid #eef1f5; border-left: 3px solid #1a73e8;
+    border-radius: 8px; padding: 0.6rem 0.75rem;
+}
+.config-lead b { color: #1f2937; }
+.config-check-row {
+    display: flex; align-items: center; gap: 0.5rem; font-weight: 500; color: #333;
+    width: 100%; justify-content: flex-start; cursor: pointer;
+    padding: 0.3rem 0.4rem; border-radius: 8px; transition: background 0.15s;
+}
+.config-check-row:hover { background: #f7f9fc; }
+.config-check-row input { width: 1rem; height: 1rem; flex: none; cursor: pointer; accent-color: #1a73e8; }
+.config-check-hint { margin-left: auto; font-size: 0.72rem; color: #9aa3af; }
+.config-agent-badge {
+    border-radius: 8px; padding: 0.45rem 0.6rem; font-size: 0.73rem; line-height: 1.6;
+    background: linear-gradient(180deg, #eefaf1, #e8f5e9);
+    border: 1px solid #bfe3c6; color: #1e7e34;
+}
+.config-vision-notice { border-radius: 8px; padding: 0.45rem 0.6rem; font-size: 0.73rem; line-height: 1.7; }
+.config-vision-notice.info {
+    background: linear-gradient(180deg, #f0f7ff, #eaf3ff);
+    border: 1px solid #c7dcfa; color: #1d4e89;
+}
+.config-vision-notice code, .config-lead code, .config-hint-line code {
+    background: rgba(26, 115, 232, 0.09); border-radius: 4px; padding: 0 0.28rem;
+    font-family: 'Cascadia Code', 'Consolas', monospace; font-size: 0.9em;
+}
+.config-model-locked {
+    border-radius: 8px; padding: 0.4rem 0.6rem; font-size: 0.73rem; line-height: 1.6;
+    background: linear-gradient(180deg, #f4fbf6, #eefaf1); border: 1px solid #cfe9d6; color: #1e7e34;
+}
+.config-divider { border-top: 1px solid #eef1f5; margin: 1rem 0 0.7rem; }
+.config-section-label { display: block; font-weight: 600; color: #374151; font-size: 0.82rem; margin-bottom: 0.4rem; }
+.config-select {
+    width: 100%; padding: 0.45rem 0.5rem; border: 1px solid #d7dce3; border-radius: 8px;
+    font-size: 0.8rem; background: #fff; color: #333;
+}
+.config-hint-line {
+    border-top: 1px dashed #e7eaee; margin: 1rem 0 0.6rem; padding-top: 0.55rem;
+    font-size: 0.73rem; line-height: 1.7; color: #8b939f;
+}
+
+/* ─── 执行许可三档：卡片式选择器（档位同时接管规则引擎开关）─── */
+.config-mode-block { display: flex; flex-direction: column; gap: 0.5rem; }
+.config-mode-head { display: flex; align-items: baseline; gap: 0.5rem; }
+.config-mode-head > span:first-child { font-weight: 600; color: #333; font-size: 0.85rem; }
+.config-mode-current { font-size: 0.7rem; color: #9aa3af; }
+.approval-modes { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0.4rem; }
+.approval-mode {
+    display: flex; flex-direction: column; align-items: flex-start; gap: 0.28rem;
+    text-align: left; cursor: pointer; padding: 0.55rem 0.6rem;
+    border: 1px solid #e3e7ed; border-radius: 10px; background: #fff;
+    transition: all 0.16s ease; font-family: inherit;
+}
+.approval-mode:hover { border-color: #b9cbe6; background: #fafcff; transform: translateY(-1px); }
+.approval-mode.active {
+    border-color: #1a73e8; background: linear-gradient(180deg, #f2f7ff, #e8f1ff);
+    box-shadow: 0 0 0 3px rgba(26, 115, 232, 0.12);
+}
+.approval-mode-name { font-size: 0.8rem; font-weight: 600; color: #1f2937; }
+.approval-mode.active .approval-mode-name { color: #1a56b8; }
+.approval-mode-desc { font-size: 0.68rem; line-height: 1.5; color: #8b939f; }
+.approval-mode-flag {
+    margin-top: 0.1rem; font-size: 0.62rem; padding: 0.05rem 0.4rem; border-radius: 999px;
+    background: #f2f4f7; color: #98a1ad; border: 1px solid #e7eaee;
+}
+.approval-mode-flag.on { background: #e8f5e9; color: #1e7e34; border-color: #bfe3c6; }
+.approval-mode-note { font-size: 0.7rem; line-height: 1.7; color: #8b939f; }
+.approval-mode-note b.ok { color: #067647; }
+.approval-mode-note b.no { color: #d92d20; }
+
+/* ─── 集成能力面板：规则引擎开关（只读，由档位决定）─── */
+.cap-note {
+    border-radius: 10px; padding: 0.55rem 0.7rem; line-height: 1.75;
+    background: linear-gradient(180deg, #f8fafc, #f4f7fb); border: 1px solid #eef1f5;
+}
+.cap-tab { transition: color 0.15s, border-color 0.15s; }
+.cap-tab:hover { color: #1a73e8; }
+.cap-modebar {
+    display: flex; align-items: baseline; gap: 0.5rem; flex-wrap: wrap;
+    padding: 0.5rem 0.65rem; border-radius: 10px; margin-top: 0.35rem;
+    background: linear-gradient(180deg, #f2f7ff, #eaf2ff); border: 1px solid #d8e6fb;
+}
+.cap-modelabel { font-size: 0.7rem; color: #8b939f; }
+.cap-modevalue { font-size: 0.84rem; font-weight: 600; color: #1a56b8; }
+.cap-modehint { font-size: 0.7rem; color: #6b7280; flex: 1 1 100%; line-height: 1.6; }
+.cap-switch-list { display: flex; flex-direction: column; gap: 0.3rem; margin-top: 0.5rem; }
+.cap-switch {
+    display: flex; align-items: baseline; gap: 0.5rem; flex-wrap: wrap;
+    padding: 0.42rem 0.6rem; border-radius: 9px;
+    border: 1px solid #eef1f5; background: #fbfcfd;
+}
+.cap-switch.on { border-color: #d7e7d9; background: #f7fcf8; }
+.cap-switch-dot {
+    width: 0.5rem; height: 0.5rem; border-radius: 50%; background: #d0d5dd; flex: none;
+    transform: translateY(-1px);
+}
+.cap-switch-dot.on { background: #22a06b; box-shadow: 0 0 0 3px rgba(34, 160, 107, 0.14); }
+.cap-switch-name { font-size: 0.78rem; color: #374151; font-weight: 500; }
+.cap-switch-state {
+    font-size: 0.66rem; font-weight: 600; border-radius: 999px; padding: 0.02rem 0.42rem;
+    background: #f2f4f7; color: #98a1ad; border: 1px solid #e7eaee;
+}
+.cap-switch.on .cap-switch-state { background: #e8f5e9; color: #1e7e34; border-color: #bfe3c6; }
+.cap-switch-hint { margin-left: auto; font-size: 0.68rem; color: #9aa3af; }
+
+/* ─── 日志面板：实时落盘提示 + 目录入口 ─── */
+.agent-logs-actions { display: inline-flex; gap: 0.35rem; align-items: center; flex-shrink: 0; }
+.agent-logs-open, .agent-logs-clear {
+    flex-shrink: 0; border: 1px solid #e0e0e0; background: #fff; color: #888;
+    border-radius: 6px; font-size: 0.7rem; padding: 0.18rem 0.5rem; cursor: pointer;
+    transition: all 0.15s;
+}
+.agent-logs-open:hover { border-color: #1a73e8; color: #1a73e8; background: #f5f9ff; }
+.agent-logs-clear:hover { border-color: #e74c3c; color: #e74c3c; background: #fdf2f2; }
+.agent-logs-path {
+    position: sticky; top: 2.1rem; z-index: 2;
+    padding: 0.34rem 0.8rem; font-size: 0.68rem; color: #6b7280;
+    background: linear-gradient(180deg, #f7fbff, #f2f7ff);
+    border-bottom: 1px solid #e3edfb;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.agent-logs-path code {
+    font-family: 'Cascadia Code', 'Consolas', monospace; font-size: 0.96em;
+    color: #1a56b8; background: rgba(26, 115, 232, 0.08);
+    border-radius: 4px; padding: 0 0.3rem;
+}
+
+/* ─── 裁决卡片：语义色（❌ 放行 / ✅ 拦截）与整体分层更清晰 ─── */
+.turn-card { border-radius: 12px; box-shadow: 0 1px 2px rgba(16, 24, 40, 0.04); }
+.turn-card-head { background: linear-gradient(180deg, #f6f8fb, #f1f4f8); }
+.turn-card-title { letter-spacing: 0.2px; }
+.turn-card-locked.incorrect { color: #d92d20; }
+.turn-card-locked.correct { color: #067647; }
+.turn-card-btn { border-radius: 999px; padding: 4px 12px; transition: all 0.15s; }
+.turn-card-foot { line-height: 1.6; }

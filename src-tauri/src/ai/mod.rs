@@ -15,6 +15,10 @@ pub mod billion_context;
 pub mod rules_engine;
 pub mod plugin_vet;
 pub mod cost_meter;
+/// 待决规则裁决队列（裁决卡片 ❌ 放行 → 一次性放行 → 自动继续）
+pub mod pending_guard;
+/// 运行时日志（实时落盘到用户本机安装目录，用户随时可查）
+pub mod runtime_log;
 
 pub use deepseek::{DeepSeekClient, DeepSeekConfig, Message, ChatResponse};
 pub use modes::{ModeMeta, ContextFile, build_system_prompt, native_system_prompt, engine_info, list_modes, meta};
@@ -24,6 +28,7 @@ pub use context::{ContextCompressor, CompressorConfig, CompressedMessage, DEFAUL
 pub use tools::{ToolRegistry, ToolCall, ToolResult, ToolSchema, TodoItem, detect_runtimes};
 pub use agent_loop::{run_agent_loop, AgentEvent, AgentEventKind, AgentLoopInput, AgentLoopOutput, LoopConfig};
 pub use approval::{ApprovalGate, ApprovalMode};
+pub use pending_guard::PendingOp;
 pub use file_parser::{parse_file, parse_files, ParsedFile, bundled_python, python_interpreter};
 pub use undo::{UndoEntry, UndoStore, apply_undo};
 pub use memory::{MemoryConfig, MemoryRecord};

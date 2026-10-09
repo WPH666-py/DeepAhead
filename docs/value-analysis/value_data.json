@@ -1,0 +1,297 @@
+{
+  "generated": "2026-09-08",
+  "fx": 6.78,
+  "workload": {
+    "calls": 20,
+    "ctx_per_call": 50000,
+    "cache_hit": 0.7,
+    "out_per_call": 2000
+  },
+  "model_costs_yuan": {
+    "v4flash": 0.374,
+    "v4pro": 1.138,
+    "luna": 0.827,
+    "terra": 8.272,
+    "sol": 15.458,
+    "astra": 38.646,
+    "k3": 11.594,
+    "opus5": 19.323,
+    "fable5": 38.646,
+    "fable51": 35.087
+  },
+  "model_costs_usd": {
+    "v4flash": 0.0552,
+    "v4pro": 0.1678,
+    "luna": 0.122,
+    "terra": 1.22,
+    "sol": 2.28,
+    "astra": 5.7,
+    "k3": 1.71,
+    "opus5": 2.85,
+    "fable5": 5.7,
+    "fable51": 5.175
+  },
+  "models": {
+    "v4flash": {
+      "name": "DeepSeek V4 Flash",
+      "in": 0.14,
+      "cin": 0.0028,
+      "out": 0.28,
+      "score": null,
+      "rank": "未公开排名",
+      "ctx": "1M",
+      "cost_yuan": 0.374
+    },
+    "v4pro": {
+      "name": "DeepSeek V4 Pro",
+      "in": 0.435,
+      "cin": 0.003625,
+      "out": 0.87,
+      "score": 66.4,
+      "rank": "-",
+      "ctx": "1M",
+      "cost_yuan": 1.138
+    },
+    "luna": {
+      "name": "GPT-5.6 Luna",
+      "in": 0.2,
+      "cin": 0.02,
+      "out": 1.2,
+      "score": 65.5,
+      "rank": "#37",
+      "ctx": "1.05M",
+      "cost_yuan": 0.827
+    },
+    "terra": {
+      "name": "GPT-5.6 Terra",
+      "in": 2.0,
+      "cin": 0.2,
+      "out": 12.0,
+      "score": 71.4,
+      "rank": "#13",
+      "ctx": "1.05M",
+      "cost_yuan": 8.272
+    },
+    "sol": {
+      "name": "GPT-5.6 Sol (促销)",
+      "in": 4.0,
+      "cin": 0.4,
+      "out": 20.0,
+      "score": 79.6,
+      "rank": "#5",
+      "ctx": "1.05M",
+      "note": "促销价至 2026-11-21; 原价 $5/$30",
+      "cost_yuan": 15.458
+    },
+    "astra": {
+      "name": "GPT-6 Astra",
+      "in": 10.0,
+      "cin": 1.0,
+      "out": 50.0,
+      "score": 81.1,
+      "rank": "#2",
+      "ctx": "1.05M",
+      "cost_yuan": 38.646
+    },
+    "k3": {
+      "name": "Kimi K3",
+      "in": 3.0,
+      "cin": 0.3,
+      "out": 15.0,
+      "score": 74.9,
+      "rank": "#7",
+      "ctx": "1.05M",
+      "cost_yuan": 11.594
+    },
+    "opus5": {
+      "name": "Claude Opus 5",
+      "in": 5.0,
+      "cin": 0.5,
+      "out": 25.0,
+      "score": 80.7,
+      "rank": "#4",
+      "ctx": "1M",
+      "cost_yuan": 19.323
+    },
+    "fable5": {
+      "name": "Claude Fable 5",
+      "in": 10.0,
+      "cin": 1.0,
+      "out": 50.0,
+      "score": 80.9,
+      "rank": "#3",
+      "ctx": "1M",
+      "cost_yuan": 38.646
+    },
+    "fable51": {
+      "name": "Claude Fable 5.1",
+      "in": 10.0,
+      "cin": 0.25,
+      "out": 50.0,
+      "score": 83.0,
+      "rank": "#1",
+      "ctx": "1M",
+      "cost_yuan": 35.087
+    }
+  },
+  "modes": {
+    "DSH": {
+      "name": "DSH — DeepSeek Harness 原生",
+      "cost_flash_yuan": 0.374,
+      "cost_pro_yuan": 1.138,
+      "score_floor": 66.4,
+      "score_ceil": 66.4,
+      "target_name": "DeepSeek V4 (原生)"
+    },
+    "DSK": {
+      "name": "DSK — Kimi K3 原装工作流",
+      "cost_flash_yuan": 0.43,
+      "cost_pro_yuan": 1.309,
+      "score_floor": 66.4,
+      "score_ceil": 74.9,
+      "target_name": "Kimi K3"
+    },
+    "DSA": {
+      "name": "DSA — GPT-6 Astra 原装工作流",
+      "cost_flash_yuan": 0.449,
+      "cost_pro_yuan": 1.366,
+      "score_floor": 66.4,
+      "score_ceil": 81.1,
+      "target_name": "GPT-6 Astra"
+    },
+    "DSF": {
+      "name": "DSF — Fable 5.1 原装工作流",
+      "cost_flash_yuan": 0.467,
+      "cost_pro_yuan": 1.422,
+      "score_floor": 66.4,
+      "score_ceil": 83.0,
+      "target_name": "Claude Fable 5.1"
+    }
+  },
+  "marginal": [
+    {
+      "key": "DSK→K3",
+      "label": "DSK → Kimi K3",
+      "from_mode": "DSK",
+      "to": "k3",
+      "desc": "先从 DSK (约¥0.43–1.31) 换到 Kimi K3 (¥11.59)",
+      "gain_lo": 0.0,
+      "gain_hi": 0.8264325395921559,
+      "d_price_lo": 10.2851710125,
+      "d_price_hi": 11.16371748,
+      "d_score_lo": 0.0,
+      "d_score_hi": 8.5
+    },
+    {
+      "key": "DSA→Sol",
+      "label": "DSA → GPT-5.6 Sol",
+      "from_mode": "DSA",
+      "to": "sol",
+      "desc": "从 DSA 换到 Sol (促销价 ¥15.46)",
+      "gain_lo": 0.0,
+      "gain_hi": 0.9366435764866434,
+      "d_price_lo": 14.092874100000003,
+      "d_price_hi": 15.009618240000002,
+      "d_score_lo": 0.0,
+      "d_score_hi": 13.199999999999989
+    },
+    {
+      "key": "DSA→Astra",
+      "label": "DSA → GPT-6 Astra",
+      "from_mode": "DSA",
+      "to": "astra",
+      "desc": "从 DSA 换到 GPT-6 Astra (¥38.65)",
+      "gain_lo": 0.0,
+      "gain_hi": 0.3943082901941955,
+      "d_price_lo": 37.2804741,
+      "d_price_hi": 38.197218240000005,
+      "d_score_lo": 0.0,
+      "d_score_hi": 14.699999999999989
+    },
+    {
+      "key": "DSF→Opus5",
+      "label": "DSF → Claude Opus 5",
+      "from_mode": "DSF",
+      "to": "opus5",
+      "desc": "从 DSF 换到 Opus 5 (¥19.32)",
+      "gain_lo": 0.0,
+      "gain_hi": 0.7988569223335272,
+      "d_price_lo": 17.9005771875,
+      "d_price_hi": 18.855519,
+      "d_score_lo": 0.0,
+      "d_score_hi": 14.299999999999997
+    },
+    {
+      "key": "DSF→Fable5",
+      "label": "DSF → Claude Fable 5",
+      "from_mode": "DSF",
+      "to": "fable5",
+      "desc": "从 DSF 换到 Fable 5 (¥38.65)",
+      "gain_lo": 0.0,
+      "gain_hi": 0.38953805882120396,
+      "d_price_lo": 37.2235771875,
+      "d_price_hi": 38.178519,
+      "d_score_lo": 0.0,
+      "d_score_hi": 14.5
+    },
+    {
+      "key": "DSF→Fable5.1",
+      "label": "DSF → Claude Fable 5.1",
+      "from_mode": "DSF",
+      "to": "fable51",
+      "desc": "从 DSF 换到 Fable 5.1 (¥35.09)",
+      "gain_lo": 0.0,
+      "gain_hi": 0.49310723438347603,
+      "d_price_lo": 33.664077187500006,
+      "d_price_hi": 34.61901900000001,
+      "d_score_lo": 0.0,
+      "d_score_hi": 16.599999999999994
+    }
+  ],
+  "chain": [
+    {
+      "label": "Luna → Terra",
+      "a": "luna",
+      "b": "terra",
+      "gain": 0.792537786589724,
+      "d_price": 7.444440000000001
+    },
+    {
+      "label": "Terra → Sol",
+      "a": "terra",
+      "b": "sol",
+      "gain": 1.140980686814714,
+      "d_price": 7.186800000000001
+    },
+    {
+      "label": "Sol → Astra",
+      "a": "sol",
+      "b": "astra",
+      "gain": 0.06468974796874191,
+      "d_price": 23.1876
+    },
+    {
+      "label": "Opus 5 → Fable 5.1",
+      "a": "opus5",
+      "b": "fable51",
+      "gain": 0.14590668316046543,
+      "d_price": 15.763500000000004
+    },
+    {
+      "label": "DSK → K3 (模式)",
+      "a": null,
+      "b": "k3",
+      "from_mode": "DSK",
+      "gain_lo": 0,
+      "gain_hi": 0
+    }
+  ],
+  "deepSwe": {
+    "astra": 74.1,
+    "sol": 72.7,
+    "opus5": 68.8,
+    "k3": 67.5,
+    "fable51": 67.4,
+    "v4flash": 54.4
+  }
+}

@@ -69,7 +69,14 @@
           <div class="dropdown-menu agent-logs-dropdown" :class="{ show: openDropdown === 'agentLogs' }">
             <div class="agent-logs-head">
               <span>运行日志（模式切换 · 提问与回复 · 工具调用 · 操作过程）</span>
-              <button class="agent-logs-clear" @click.stop="clearLogs">清空日志</button>
+              <span class="agent-logs-actions">
+                <button class="agent-logs-open" title="在文件管理器中打开日志目录" @click.stop="openLogDir">📂 日志目录</button>
+                <button class="agent-logs-clear" @click.stop="clearLogs">清空日志</button>
+              </span>
+            </div>
+            <!-- 实时落盘提示：用户不打开面板也能随时查看 -->
+            <div class="agent-logs-path" :title="logPathHint">
+              💾 已实时落盘到安装目录：<code>{{ logPathHint }}</code>
             </div>
             <!-- Agent 运行进度 -->
             <div class="dropdown-item agent-progress-item" v-if="store.isLoading && store.useTools">
@@ -214,7 +221,8 @@
                 title="撤回该对话：内容回到输入框，并撤销本轮代码修改与结果"
                 @click="withdrawMessage(i)"
               >↩ 撤回</button>
-              <!-- 回合末裁决卡片（dsh-rule-engine-client 移植）：逐条独立判定，判例一次性锁定 -->
+              <!-- 回合裁决卡片（dsh-rule-engine-client 移植）：逐条独立判定，判例一次性锁定。
+                   ❌ 放行 = 放行该操作并自动回复「继续」；✅ 拦截 = 拦下该操作。 -->
               <div v-if="msg.role === 'assistant' && msg.id && turnCardsByMsg[msg.id]" class="turn-card">
                 <div class="turn-card-head">
                   <span class="turn-card-title">⚖️ 回合裁决</span>
@@ -229,17 +237,20 @@
                     <span class="turn-card-rule">规则 {{ blk.rule_id || '?' }}</span>
                     <span class="turn-card-tool">{{ blk.tool }}</span>
                     <span v-if="blk.label" class="turn-card-locked" :class="blk.label">
-                      {{ blk.label === 'correct' ? '✓ 已判：拦对了' : '✗ 已判：拦错了' }}
+                      {{ blk.label === 'incorrect' ? '❌ 已放行（Agent 继续）' : '✅ 已拦截' }}
                     </span>
                   </div>
                   <div class="turn-card-args">{{ blk.args }}</div>
                   <div class="turn-card-reason">{{ blk.reason }}</div>
                   <div v-if="!blk.label" class="turn-card-actions">
-                    <button class="turn-card-btn ok" @click="store.rateTurnCard(turnCardsByMsg[msg.id].key, blk.i, 'correct')">✅ 拦对了</button>
-                    <button class="turn-card-btn no" @click="store.rateTurnCard(turnCardsByMsg[msg.id].key, blk.i, 'incorrect')">❌ 拦错了</button>
+                    <button class="turn-card-btn no" @click="store.rateTurnCard(turnCardsByMsg[msg.id].key, blk.i, 'incorrect')">❌ 放行（自动继续）</button>
+                    <button class="turn-card-btn ok" @click="store.rateTurnCard(turnCardsByMsg[msg.id].key, blk.i, 'correct')">✅ 拦截</button>
                   </div>
                 </div>
-                <div class="turn-card-foot">判例一次性锁定；❌ 会使同指纹命令学习放行（可用 /guard label clear 撤销）</div>
+                <div class="turn-card-foot">
+                  ❌ 放行 = 放行该操作并自动回复「继续」，Agent 接着跑（同指纹命令 7 天内学习放行，可用 /guard label clear 撤销）；
+                  ✅ 拦截 = 拦下该操作，Agent 换方案或先向你确认。判例一次性锁定。
+                </div>
               </div>
             </div>
             <div v-if="store.isLoading" class="message ai-message"><div class="msg-role">AI</div><div class="msg-content">{{ store.streamingContent || '思考中...' }}</div></div>
@@ -303,16 +314,20 @@
               <button class="ai-send-btn" :disabled="store.isLoading || (!chatInput.trim() && store.pastedImages.length === 0)" @click="handleSend">发送</button>
             </div>
           </div>
-          <!-- 执行许可审批卡片（需分步确认模式：对标 Harness 审批门） -->
+          <!-- 执行许可审批卡片（需逐步确认 / 仅确认风险操作：对标 Harness 审批门） -->
           <div v-if="store.pendingApproval && store.isLoading" class="tool-approval-overlay">
             <div class="tool-approval-card">
-              <div class="tool-approval-head">🔐 工具调用待批准 <span class="tool-approval-mode">需分步确认</span></div>
+              <div class="tool-approval-head">
+                🔐 工具调用待确认
+                <span class="tool-approval-mode">{{ approvalModeLabel(store.approvalMode) }}</span>
+              </div>
               <div class="tool-approval-name">{{ store.pendingApproval.name }}</div>
               <pre class="tool-approval-args">{{ formatArgs(store.pendingApproval.arguments) }}</pre>
               <div class="tool-approval-actions">
-                <button class="tool-approval-btn allow" @click="store.respondApproval(true)">✅ 允许执行</button>
-                <button class="tool-approval-btn deny" @click="store.respondApproval(false)">⛔ 拒绝（模型将换方案）</button>
+                <button class="tool-approval-btn allow" @click="store.respondApproval(true)">❌ 放行（自动回复「继续」）</button>
+                <button class="tool-approval-btn block" @click="store.respondApproval(false)">✅ 拦截（换方案或先问你）</button>
               </div>
+              <div class="tool-approval-note">❌ = 放行该操作并自动回复「继续」，Agent 接着跑；✅ = 拦下该操作。</div>
             </div>
           </div>
         </div>
@@ -691,50 +706,79 @@
 
     <!-- 自动更新弹框：发现新版本 → 暂不更新（10 分钟后再提醒）/ 立即更新 -->
     <div class="modal-overlay update-modal" :class="{ show: showUpdateModal }" @click.self="snoozeUpdate">
-      <div class="modal-box" style="width:560px">
-        <div class="modal-header">
-          <h3>🎉 发现新版本</h3>
-          <button class="modal-close" @click="snoozeUpdate">&times;</button>
+      <div class="modal-box">
+        <!-- 顶部渐变 hero：版本跃迁一眼可见 -->
+        <div class="update-hero">
+          <div class="update-hero-icon">🎉</div>
+          <div class="update-hero-text">
+            <div class="update-hero-title">发现新版本</div>
+            <div class="update-hero-sub">从 Gitee 一键升级，全程无窗口</div>
+          </div>
+          <button class="update-hero-close" @click="snoozeUpdate" title="暂不更新">&times;</button>
         </div>
-        <div class="modal-body">
+
+        <div class="update-body">
+          <!-- 版本跃迁 -->
           <div class="update-versions">
-            <span class="update-cur">当前 {{ updateInfo?.current }}</span>
-            <span class="update-arrow">→</span>
-            <span class="update-new">{{ updateInfo?.latest }}</span>
+            <div class="update-ver-chip cur">
+              <span class="update-ver-label">当前</span>
+              <span class="update-ver-num">{{ updateInfo?.current || '—' }}</span>
+            </div>
+            <div class="update-arrow">→</div>
+            <div class="update-ver-chip new">
+              <span class="update-ver-label">最新</span>
+              <span class="update-ver-num">{{ updateInfo?.latest || '—' }}</span>
+            </div>
           </div>
-          <div v-if="updateInfo?.asset" class="update-asset">
-            安装包：<code>{{ updateInfo.asset.name }}</code>
-            <span v-if="updateInfo.asset.size">（{{ (updateInfo.asset.size / 1048576).toFixed(1) }} MB）</span>
-            <span v-else>（大小未知）</span>
+
+          <!-- 元信息 chips -->
+          <div class="update-meta">
+            <span v-if="updateInfo?.asset" class="update-chip">
+              📦 {{ updateInfo.asset.name }}
+              <template v-if="updateInfo.asset.size"> · {{ (updateInfo.asset.size / 1048576).toFixed(1) }} MB</template>
+            </span>
+            <span v-if="updateInfo?.published_at" class="update-chip">🕒 {{ updateInfo.published_at }}</span>
+            <span class="update-chip ok">🔒 静默卸载 → 静默安装 → 自动重启</span>
           </div>
-          <div v-if="updateInfo?.published_at" class="update-date">发布时间：{{ updateInfo.published_at }}</div>
 
           <!-- 下载/安装进度 -->
           <div v-if="updateBusy" class="update-progress">
-            <div class="update-progress-label">
-              <span v-if="updatePhase === 'downloading'">
-                正在从 Gitee 下载…（{{ (updateProgress.downloaded / 1048576).toFixed(1) }} MB<template v-if="updateProgress.total"> / {{ (updateProgress.total / 1048576).toFixed(1) }} MB</template>）
+            <div class="update-progress-head">
+              <span class="update-progress-phase">
+                {{ updatePhase === 'downloading' ? '正在从 Gitee 下载' : '正在启动安装' }}
               </span>
-              <span v-else>正在启动更新：应用即将退出，随后自动卸载旧版并安装新版…</span>
+              <span class="update-progress-pct" v-if="updatePhase === 'downloading' && updateProgress.total">
+                {{ Math.round(updatePct) }}%
+              </span>
             </div>
-            <div class="ai-ctx-bar">
-              <div class="ai-ctx-fill" :style="{ width: updatePct + '%' }"></div>
+            <div class="update-progress-bar">
+              <div class="update-progress-fill" :class="{ installing: updatePhase !== 'downloading' }" :style="{ width: Math.max(updatePct, 4) + '%' }"></div>
+            </div>
+            <div class="update-progress-note">
+              <template v-if="updatePhase === 'downloading'">
+                {{ (updateProgress.downloaded / 1048576).toFixed(1) }} MB<template v-if="updateProgress.total"> / {{ (updateProgress.total / 1048576).toFixed(1) }} MB</template>
+                · 下载完成后应用会自动退出并完成升级
+              </template>
+              <template v-else>
+                应用即将退出，随后自动卸载旧版并安装新版，完成后会自动重新打开。
+              </template>
             </div>
           </div>
 
+          <!-- 更新说明 -->
           <div v-if="updateInfo?.notes" class="update-notes">
-            <div class="update-notes-title">更新内容</div>
+            <div class="update-notes-title">📋 更新内容</div>
             <pre class="update-notes-body">{{ updateInfo.notes }}</pre>
           </div>
 
           <div class="update-hint">
-            更新流程：从 Gitee 下载安装包 → 退出当前版本 → 静默卸载旧版 → 静默安装新版 → 自动重新启动。
-            <br>选择「暂不更新」后每 10 分钟提醒一次，直到你点击「立即更新」。
+            选择「暂不更新」后每 <b>10 分钟</b>提醒一次，直到你点击「立即更新」。
           </div>
         </div>
-        <div class="form-actions">
+
+        <div class="update-actions">
           <button class="btn btn-secondary" :disabled="updateBusy" @click="snoozeUpdate">暂不更新</button>
-          <button class="btn btn-primary" :disabled="updateBusy" @click="startUpdate">
+          <button class="btn btn-primary update-go" :disabled="updateBusy" @click="startUpdate">
             {{ updateBusy ? (updatePhase === 'downloading' ? '下载中…' : '安装中…') : '立即更新' }}
           </button>
         </div>
@@ -809,7 +853,7 @@
                 <b style="color:#333">DSF</b> — Claude Fable 5.1 原装工作流引擎（fable-orchestrator + fablewright, MIT）：CALL SHEET 路由 → 五段式委派 → 亲验 diff → 只读裁决。适合高波动、批量改造。
               </div>
               <div style="font-size:0.78rem;color:#999">
-                DSH 为原生 Harness 工作流；DSK / DSA / DSF 由 Rust 移植的厂商原装工作流引擎驱动（原版源码见仓库 vendor/），与 DeepSeek V4 运行时强强结合（无 Persona 模拟层）。全部模式只消耗 DeepSeek Token；勾选「工具」即默认 Agent 模式，还可选择执行许可：需分步确认 / 全流程开放。日志面板可查看模式切换、每轮提问与回复、全部工具调用结果与操作过程。
+                DSH 为原生 Harness 工作流；DSK / DSA / DSF 由 Rust 移植的厂商原装工作流引擎驱动（原版源码见仓库 vendor/），与 DeepSeek V4 运行时强强结合（无 Persona 模拟层）。全部模式只消耗 DeepSeek Token；DeepSeek 自 V4-exp 起原生支持多模态（识图）。勾选「工具」即默认 Agent 模式，执行许可分三档：<b>需逐步确认</b> / <b>仅确认风险操作</b> / <b>全流程开放</b>——档位同时决定规则引擎的开关（前两档全开，全流程开放全关并永久放行），开关不交给用户自选。日志面板可查看模式切换、每轮提问与回复、全部工具调用结果与操作过程，并实时落盘到安装目录（<code>%LOCALAPPDATA%\DeepAhead\logs</code>）。
               </div>
             </div>
           </div>
@@ -844,52 +888,74 @@
     <div class="modal-overlay" :class="{ show: showAIConfigModal }" @click.self="showAIConfigModal = false">
       <div class="modal-box" style="width:480px">
         <div class="modal-header">
-          <h3>DeepSeek V4 API 配置（唯一运行时）</h3>
+          <h3>Deepseek-API 运行时</h3>
           <button class="modal-close" @click="showAIConfigModal = false">&times;</button>
         </div>
         <div class="modal-body">
-          <p style="font-size:0.78rem;color:#888;margin-bottom:0.8rem">
-            DeepAhead 只有 DeepSeek V4 一个运行时模型。DSH 为原生 Harness 工作流，DSK / DSA / DSF 由厂商原装工作流引擎（kimi-code / astra-advisor / fable-orchestrator+fablewright 移植）驱动，均走 DeepSeek Token。
+          <p class="config-lead">
+            DeepAhead 只有 <b>DeepSeek V4</b> 一个运行时模型。DSH 为原生 Harness 工作流，DSK / DSA / DSF 由厂商原装工作流引擎
+            （kimi-code / astra-advisor / fable-orchestrator+fablewright 移植）驱动，均走 DeepSeek Token。
+            <b>DeepSeek 自 V4-exp 起原生支持多模态（识图）</b>，图片可直接粘贴、无需中转。
           </p>
           <!-- 能力开关：工具（Agent 模式） / 视觉引擎 / max -->
           <div class="config-field" style="display:flex;flex-direction:column;gap:0.55rem">
-            <label style="display:flex;align-items:center;gap:0.5rem;font-weight:500;color:#333;width:100%;justify-content:flex-start;cursor:pointer">
-              <input type="checkbox" :checked="store.useTools" @change="toggleTools" style="width:1rem;height:1rem;flex:none;cursor:pointer" />
+            <label class="config-check-row">
+              <input type="checkbox" :checked="store.useTools" @change="toggleTools" />
               <span>🛠 工具</span>
-              <span style="margin-left:auto;font-size:0.72rem;color:#999">勾选即默认 Agent 模式 · 9 工具 Agent Loop</span>
+              <span class="config-check-hint">勾选即默认 Agent 模式 · 9 工具 Agent Loop</span>
             </label>
             <!-- 勾选工具 = Agent 模式（默认），并显示执行许可（对标 Harness 审批） -->
             <div v-if="store.useTools" class="config-agent-badge">
-              🤖 已启用 <b>Agent 模式</b>（勾选「工具」即默认走 Agent 循环：自主调用 9 个工具直到得出结论）
+              🤖 已启用 <b>Agent 模式</b>：自主调用 9 个工具直到得出结论；执行许可档位决定「要不要先问你」。
             </div>
-            <div v-if="store.useTools" style="display:flex;align-items:center;gap:0.5rem;width:100%;justify-content:flex-start">
-              <span style="font-weight:500;color:#333;flex:none;font-size:0.85rem">🔐 执行许可</span>
-              <select v-model="store.approvalMode" @change="store.setApprovalMode(store.approvalMode)" style="flex:1;padding:0.35rem 0.45rem;border:1px solid #ccc;border-radius:5px;font-size:0.8rem">
-                <option value="step">需分步确认（每个工具调用先由你批准）</option>
-                <option value="open">全流程开放（自动批准全部调用）</option>
-              </select>
+            <!-- 执行许可三档：档位唯一决定规则引擎的开关，用户不需要（也不能）自选开关 -->
+            <div v-if="store.useTools" class="config-mode-block">
+              <div class="config-mode-head">
+                <span>🔐 执行许可</span>
+                <span class="config-mode-current">档位同时接管规则引擎开关</span>
+              </div>
+              <div class="approval-modes">
+                <button
+                  v-for="m in APPROVAL_MODES"
+                  :key="m.id"
+                  type="button"
+                  class="approval-mode"
+                  :class="{ active: store.approvalMode === m.id }"
+                  @click="store.setApprovalMode(m.id)"
+                >
+                  <span class="approval-mode-name">{{ m.label }}</span>
+                  <span class="approval-mode-desc">{{ m.desc }}</span>
+                  <span class="approval-mode-flag" :class="{ on: m.ruleEngineOn }">
+                    规则引擎 {{ m.ruleEngineOn ? "全开" : "全关 · 永久放行" }}
+                  </span>
+                </button>
+              </div>
+              <div class="approval-mode-note">
+                卡片语义：<b class="no">❌ 放行</b> = 放行该操作并自动回复「继续」，Agent 接着跑；
+                <b class="ok">✅ 拦截</b> = 拦下该操作，Agent 换方案或先向你确认。
+              </div>
             </div>
-            <label style="display:flex;align-items:center;gap:0.5rem;font-weight:500;color:#333;width:100%;justify-content:flex-start;cursor:pointer">
-              <input type="checkbox" :checked="multimodalEnabled" @change="toggleMultimodal" style="width:1rem;height:1rem;flex:none;cursor:pointer" />
+            <label class="config-check-row">
+              <input type="checkbox" :checked="multimodalEnabled" @change="toggleMultimodal" />
               <span>🖼 视觉引擎</span>
-              <span style="margin-left:auto;font-size:0.72rem;color:#999">识图（OCR/视觉）</span>
+              <span class="config-check-hint">识图增强（OCR / 表格 / 公式）</span>
             </label>
-            <!-- 当前模型本身不具备多模态能力时的提示 -->
-            <div v-if="!modelHasNativeVision" class="config-vision-notice">
-              ⚠️ 当前连接的模型 <b>{{ modelInput || 'deepseek-chat' }}</b> 本身不具备多模态（识图）能力，
-              需要<b>搭配视觉引擎</b>使用：勾选「视觉引擎」并填写下方视觉模型配置，图片会先经视觉引擎转译为结构化文本再交给主模型。
+            <!-- 可选增强说明：DeepSeek V4-exp 起原生多模态，视觉引擎只用于重文档 -->
+            <div class="config-vision-notice info">
+              💡 DeepSeek <b>自 V4-exp 起原生支持多模态</b>，<code>{{ modelInput || 'deepseek-chat' }}</code> 可直接粘贴图片识图。
+              勾选「视觉引擎」可再加一层 OCR / 表格 / 公式转译（截图、扫描件、复杂版式更稳），属于可选增强、不是识图的前提。
             </div>
-            <label style="display:flex;align-items:center;gap:0.5rem;font-weight:500;color:#333;width:100%;justify-content:flex-start;cursor:pointer">
-              <input type="checkbox" :checked="maxMode" @change="toggleMaxMode" style="width:1rem;height:1rem;flex:none;cursor:pointer" />
+            <label class="config-check-row">
+              <input type="checkbox" :checked="maxMode" @change="toggleMaxMode" />
               <span>max</span>
-              <span style="margin-left:auto;font-size:0.72rem;color:#999">最大能力模式</span>
+              <span class="config-check-hint">最大能力模式</span>
             </label>
           </div>
           <div class="config-field"><label>API Key</label><input type="password" v-model="apiKeyInput" placeholder="sk-..."></div>
           <div class="config-field"><label>Base URL</label><input v-model="baseUrlInput" placeholder="https://api.deepseek.com"></div>
           <div class="config-field">
             <label>Model（主模型只支持 DeepSeek，请手动输入）</label>
-            <input v-model="modelInput" list="deepseek-model-hints" placeholder="如 deepseek-chat / deepseek-reasoner / deepseek-v4">
+            <input v-model="modelInput" list="deepseek-model-hints" placeholder="如 deepseek-flash / deepseek-chat / deepseek-reasoner">
             <datalist id="deepseek-model-hints">
               <option v-for="m in DEEPSEEK_MODELS" :key="m.id" :value="m.id">{{ m.label }}</option>
             </datalist>
@@ -898,16 +964,17 @@
             </div>
             <div v-else-if="modelInput.trim()" class="config-model-locked" style="margin-top:0.3rem">
               ✅ 已识别为 DeepSeek 模型：<b>{{ modelInput }}</b>
+              <span v-if="modelHasNativeVision">· 原生多模态（V4-exp 起，可直接粘贴图片）</span>
             </div>
           </div>
 
           <!-- 视觉引擎开启时：显示视觉识别设置 -->
           <template v-if="multimodalEnabled">
-            <div style="border-top:1px solid #eee;margin:0.9rem 0 0.6rem"></div>
-            <label style="font-weight:500;color:#333">视觉引擎（DeepSeek-OCR / ModLens）</label>
+            <div class="config-divider"></div>
+            <label class="config-section-label">视觉引擎增强（可选：DeepSeek-OCR / ModLens）</label>
             <div class="config-field">
               <label>引擎</label>
-              <select v-model="visionProvider" style="width:100%;padding:0.45rem 0.5rem;border:1px solid #ccc;border-radius:5px">
+              <select v-model="visionProvider" class="config-select">
                 <option value="modlens">ModLens（截图/语义/结构化）</option>
                 <option value="deepseek-ocr">DeepSeek-OCR（文档/公式/表格）</option>
               </select>
@@ -916,9 +983,10 @@
             <div class="config-field"><label>Vision Base URL</label><input v-model="visionBaseUrl" placeholder="https://api.openai.com/v1"></div>
             <div class="config-field"><label>Vision Model</label><input v-model="visionModel" placeholder="gpt-4o-mini / glm-4v-plus"></div>
           </template>
-          <!-- 纯文本模式提示 -->
-          <div v-else style="border-top:1px dashed #eee;margin:0.9rem 0 0.6rem;padding-top:0.4rem;font-size:0.72rem;color:#999">
-            当前为纯文本模式，识图已禁用；开启「视觉引擎」可解锁视觉识别配置。
+          <!-- 未开启视觉引擎：说明这只是可选增强 -->
+          <div v-else class="config-hint-line">
+            未开启视觉引擎增强。DeepSeek V4-exp 起模型原生多模态，粘贴的图片会直接交给主模型识图；
+            开启后可额外走 OCR / 表格 / 公式转译，适合扫描件与复杂版式。
           </div>
 
           <div class="form-actions">
@@ -1057,22 +1125,38 @@
                 </div>
               </div>
               <div v-else class="cap-hint">暂无审计记录。</div>
-              <!-- 回合末裁决卡片 / 任务契约：勾选只改草稿，底部「保存设置」统一提交 -->
-              <div class="cap-sub">开关</div>
-              <label class="cap-check">
-                <input type="checkbox" v-model="rulesDraft.enabled">
-                <span>启用规则引擎（关闭后硬门与裁决卡片都不生效）</span>
-              </label>
-              <label class="cap-check">
-                <input type="checkbox" v-model="rulesDraft.turnCardEnabled">
-                <span>回合末裁决卡片（默认关；开启后每轮被拦记录会生成 ✅/❌ 可判卡片）</span>
-              </label>
-              <label class="cap-check">
-                <input type="checkbox" v-model="rulesDraft.taskContractEnabled">
-                <span>任务契约（与裁决卡片同组，默认关）</span>
-              </label>
+              <!-- 规则引擎开关：**由执行许可档位唯一决定**，不交给用户自选 -->
+              <div class="cap-sub">开关（由执行许可档位唯一决定，不可自选）</div>
+              <div class="cap-modebar">
+                <span class="cap-modelabel">当前档位</span>
+                <span class="cap-modevalue">🔐 {{ approvalModeLabel(store.approvalMode) }}</span>
+                <span class="cap-modehint">
+                  {{ store.approvalMode === 'open'
+                    ? '规则引擎全部开关关闭：所有操作永久放行'
+                    : (store.approvalMode === 'step'
+                      ? '规则引擎全部开关开启，每一步工具调用都查给你看'
+                      : '规则引擎全部开关开启，只有风险操作才查给你看') }}
+                </span>
+              </div>
+              <div class="cap-switch-list">
+                <div v-for="sw in rulesSwitches" :key="sw.key" class="cap-switch" :class="{ on: sw.on }">
+                  <span class="cap-switch-dot" :class="{ on: sw.on }"></span>
+                  <span class="cap-switch-name">{{ sw.label }}</span>
+                  <span class="cap-switch-state">{{ sw.on ? '开' : '关' }}</span>
+                  <span class="cap-switch-hint">{{ sw.hint }}</span>
+                </div>
+              </div>
+              <div class="cap-hint">
+                要改这些开关，只需在「AI 配置 → 执行许可」里换档位：需逐步确认 / 仅确认风险操作 → 全开；全流程开放 → 全关并永久放行。
+              </div>
               <!-- /guard 命令行 -->
               <div class="cap-sub">/guard 命令行</div>
+              <div class="cap-modebar" v-if="store.approvalMode === 'open'">
+                <span class="cap-modelabel">提示</span>
+                <span class="cap-modehint">
+                  当前「全流程开放」档位下规则引擎全部开关关闭，硬门不生效：/guard 命令仍可执行（用于查看审计与判例），但不会拦下任何调用。
+                </span>
+              </div>
               <div class="cap-cmdbar">
                 <input
                   v-model="guardCommand"
@@ -1091,11 +1175,11 @@
                 </div>
               </div>
             </template>
-            <!-- 底部操作区：保存设置（提交整页配置） -->
+            <!-- 底部操作区 -->
             <div class="cap-actions">
               <button class="btn btn-secondary" style="font-size:0.78rem" @click="refreshRules">刷新</button>
-              <button class="btn btn-primary" style="font-size:0.78rem" @click="saveRulesSettings">
-                {{ rulesSaved ? '✅ 已保存' : '保存设置' }}
+              <button class="btn btn-primary" style="font-size:0.78rem" @click="syncRulesWithMode">
+                按当前档位同步开关
               </button>
             </div>
           </template>
@@ -1124,7 +1208,7 @@
 
 <script setup lang="ts">
 import { ref, onMounted, nextTick, watch, computed } from "vue";
-import { useAppStore, MAX_PASTE_IMAGES, type LogKind } from "../stores/app";
+import { useAppStore, MAX_PASTE_IMAGES, APPROVAL_MODES, approvalModeLabel, type LogKind } from "../stores/app";
 import { tauriAPI } from "../services/tauri-api";
 import type { GitGraphCommit, GitGraphLaneRow, LaneGlyph, TurnCard, UpdateInfo } from "../services/tauri-api";
 import FileTreeNode from "../components/layout/FileTreeNode.vue";
@@ -1261,6 +1345,24 @@ function clearLogs() {
   store.clearLogs();
   expandedLogs.value = {};
 }
+// ─── 日志实时落盘（安装目录）───
+const logPathHint = ref("…");
+async function refreshLogPath() {
+  try {
+    const st = await tauriAPI.runtimeLogStatus();
+    logPathHint.value = st.file || st.dir || "（未知）";
+  } catch (_) {
+    logPathHint.value = "%LOCALAPPDATA%\\DeepAhead\\logs";
+  }
+}
+async function openLogDir() {
+  try {
+    const dir = await tauriAPI.runtimeLogOpenDir();
+    store.appendLog("system", "已打开日志目录", dir);
+  } catch (e: any) {
+    alert(`打开日志目录失败：${e}`);
+  }
+}
 /** 回合裁决卡片：按助手消息 id 建索引，便于模板直接取用 */
 const turnCardsByMsg = computed<Record<string, TurnCard>>(() => {
   const map: Record<string, TurnCard> = {};
@@ -1314,10 +1416,10 @@ const modelInput = ref("deepseek-chat");
 
 // ─── 主模型：只支持 DeepSeek 模型（用户手动输入，校验必须含 deepseek）───
 const DEEPSEEK_MODELS = [
-  { id: "deepseek-chat",     label: "DeepSeek V4 通用 · Agent/工具调用" },
-  { id: "deepseek-reasoner", label: "DeepSeek V4 推理 · thinking" },
-  { id: "deepseek-coder",    label: "代码专用" },
-  { id: "deepseek-vl",       label: "多模态识图（可选）" },
+  { id: "deepseek-flash",    label: "DeepSeek V4 Flash · 原生多模态 · 快" },
+  { id: "deepseek-chat",     label: "DeepSeek V4 通用 · 原生多模态 · Agent/工具调用" },
+  { id: "deepseek-reasoner", label: "DeepSeek V4 推理 · 原生多模态 · thinking" },
+  { id: "deepseek-vl",       label: "DeepSeek 多模态端点（VL）" },
 ];
 /**
  * 是否接受为主模型：名称必须包含 deepseek（大小写不限，
@@ -1486,11 +1588,20 @@ const capTab = ref("cost");
 // 规则引擎面板：配置 / /guard 命令行 / 指纹放行
 const rulesCfg = ref<any>(null);
 /**
- * 规则引擎开关的"草稿"状态。
- * 页面上的勾选只改草稿，点「保存设置」才写回后端 —— 这样一次保存的是整页配置。
+ * 规则引擎开关**不交给用户自选**：由执行许可档位唯一决定，这里只做只读展示。
+ *   - 需逐步确认 / 仅确认风险操作 → 规则引擎所有开关全开
+ *   - 全流程开放 → 规则引擎所有开关全关（所有操作永久放行）
  */
-const rulesDraft = ref({ enabled: true, turnCardEnabled: false, taskContractEnabled: false });
-const rulesSaved = ref(false);
+const rulesModeInfo = ref<{ mode: string; label: string; rule_engine_on: boolean; turn_card_on: boolean; gate_every_call: boolean } | null>(null);
+/** 当前档位对应的规则引擎开关（只读推导，供面板展示） */
+const rulesSwitches = computed(() => {
+  const on = rulesModeInfo.value?.rule_engine_on ?? store.approvalMode !== "open";
+  return [
+    { key: "enabled", label: "启用规则引擎（硬门）", on, hint: on ? "拦截风险调用并记入审计" : "关闭：硬门不生效，所有操作永久放行" },
+    { key: "turnCard", label: "回合裁决卡片（❌ 放行 / ✅ 拦截）", on: rulesModeInfo.value?.turn_card_on ?? on, hint: on ? "被拦记录会生成可判卡片" : "关闭：不产生裁决卡片" },
+    { key: "taskContract", label: "任务契约（路径 / 类别 / 预算约束）", on, hint: on ? "与硬门同组生效" : "关闭" },
+  ];
+});
 const guardCommand = ref("");
 const guardOutput = ref("");
 const guardBusy = ref(false);
@@ -1500,52 +1611,33 @@ async function refreshRulesConfig() {
   try {
     const cfg = await tauriAPI.rulesGetConfig();
     rulesCfg.value = cfg;
-    rulesDraft.value = {
-      enabled: cfg?.enabled !== false,
-      turnCardEnabled: !!cfg?.turn_card_enabled,
-      taskContractEnabled: !!cfg?.task_contract_enabled,
-    };
     const l = await tauriAPI.rulesLabels();
     rulesLabels.value = l.labels || [];
   } catch (_) { rulesCfg.value = null; }
 }
 
-/** 勾选只改草稿（不落盘），底部「保存设置」才提交整页配置 */
-function onRulesDraftToggle(key: "enabled" | "turnCardEnabled" | "taskContractEnabled", e: Event) {
-  const val = (e.target as HTMLInputElement).checked;
-  rulesDraft.value = { ...rulesDraft.value, [key]: val };
-  rulesSaved.value = false;
-}
-
-/** 保存设置：把当前页面的规则引擎配置写回后端并本地持久化 */
-async function saveRulesSettings() {
+/** 档位切换 → 规则引擎开关联动（面板里唯一的"保存"语义，用户不再直接拨开关） */
+async function syncRulesWithMode() {
   try {
-    const saved = await tauriAPI.rulesSetToggles({
-      enabled: rulesDraft.value.enabled,
-      turnCardEnabled: rulesDraft.value.turnCardEnabled,
-      taskContractEnabled: rulesDraft.value.taskContractEnabled,
-    });
-    rulesCfg.value = saved;
-    rulesDraft.value = {
-      enabled: saved?.enabled !== false,
-      turnCardEnabled: !!saved?.turn_card_enabled,
-      taskContractEnabled: !!saved?.task_contract_enabled,
+    const linked = await tauriAPI.rulesLinkMode(store.approvalMode);
+    rulesModeInfo.value = {
+      mode: linked.mode,
+      label: linked.label,
+      rule_engine_on: linked.rule_engine_on,
+      turn_card_on: linked.turn_card_on,
+      gate_every_call: linked.gate_every_call,
     };
-    localStorage.setItem("deep-ide-rules-cfg", JSON.stringify(rulesDraft.value));
-    rulesSaved.value = true;
-    setTimeout(() => { rulesSaved.value = false; }, 2500);
+    rulesCfg.value = linked.config || rulesCfg.value;
     store.appendLog(
       "system",
-      "规则引擎设置已保存",
-      `裁决卡片 ${rulesDraft.value.turnCardEnabled ? "开" : "关"}｜任务契约 ${rulesDraft.value.taskContractEnabled ? "开" : "关"}｜引擎 ${rulesDraft.value.enabled ? "开" : "关"}`
-    );
-    store.addSystemMessage(
-      `规则引擎设置已保存：回合末裁决卡片 ${rulesDraft.value.turnCardEnabled ? "开" : "关"}，任务契约 ${rulesDraft.value.taskContractEnabled ? "开" : "关"}`
+      `规则引擎已按「${linked.label}」档位接管`,
+      `引擎 ${linked.rule_engine_on ? "全开" : "全关（永久放行）"}｜裁决卡片 ${linked.turn_card_on ? "开" : "关"}｜逐调用审批 ${linked.gate_every_call ? "开" : "关"}`
     );
   } catch (e: any) {
-    alert(`保存规则引擎设置失败：${e}`);
+    alert(`规则引擎联动失败：${e}`);
   }
 }
+
 async function runGuard() {
   const cmd = guardCommand.value.trim();
   if (!cmd) return;
@@ -1591,6 +1683,17 @@ async function refreshRules() {
 /** 加载全部集成能力面板数据 */
 async function refreshCapabilities() {
   await Promise.all([refreshCost(), refreshCtxEngine(), refreshMemory(), refreshRules(), refreshRulesConfig()]);
+  // 规则引擎面板的开关由档位推导，进面板时同步一次联动结果
+  try {
+    const linked = await tauriAPI.rulesLinkMode(store.approvalMode);
+    rulesModeInfo.value = {
+      mode: linked.mode,
+      label: linked.label,
+      rule_engine_on: linked.rule_engine_on,
+      turn_card_on: linked.turn_card_on,
+      gate_every_call: linked.gate_every_call,
+    };
+  } catch (_) {}
 }
 /**
  * 记忆配置开关。
@@ -1672,26 +1775,35 @@ async function doCostClear() {
 
 /**
  * 当前连接的模型本身是否具备多模态（识图）能力。
- * DeepSeek V4 运行时为纯文本模型；若用户把 Model 改成已知的多模态模型
- * （gpt-4o / glm-4v / qwen-vl / claude-3 / gemini 等），则可直接粘贴图片。
+ * **DeepSeek 自 V4-exp 起原生支持多模态**：deepseek-flash / deepseek-chat /
+ * deepseek-reasoner / deepseek-v4* 等主流型号都可以直接粘贴图片识图；
+ * 旧型号 deepseek-vl 走专门的多模态端点，同样算原生多模态。
+ * 只有更早的纯文本型号（如 deepseek-coder 老版本）才需要视觉引擎中转。
  */
 const NATIVE_VISION_HINTS = [
+  // DeepSeek V4-exp 起：原生多模态
+  "deepseek-flash", "deepseek-chat", "deepseek-reasoner", "deepseek-v4", "deepseek-vl",
+  // 其他厂商（保留兼容：用户把 Model 改成别的多模态模型时不再误提示）
   "gpt-4o", "gpt-4.1", "gpt-4-turbo", "gpt-4-vision", "o1", "o3", "o4",
   "glm-4v", "qwen-vl", "qwen2-vl", "qwen2.5-vl", "internvl", "llava",
   "claude-3", "claude-4", "claude-sonnet", "claude-opus", "claude-haiku",
-  "gemini", "deepseek-vl", "step-1v", "yi-vision", "minicpm-v", "moonshot-v1-vision",
+  "gemini", "step-1v", "yi-vision", "minicpm-v", "moonshot-v1-vision",
 ];
+/** 明确不具备多模态的历史纯文本型号（优先于上面的提示词判定） */
+const TEXT_ONLY_HINTS = ["deepseek-coder", "deepseek-math", "deepseek-v2", "deepseek-v3-base"];
 const modelHasNativeVision = computed(() => {
   const m = (modelInput.value || store.model || "").toLowerCase();
+  if (!m) return false;
+  if (TEXT_ONLY_HINTS.some(h => m.includes(h))) return false;
   return NATIVE_VISION_HINTS.some(h => m.includes(h));
 });
-/** 是否允许直接粘贴图片：模型原生多模态 或 已开启视觉引擎 */
+/** 是否允许直接粘贴图片：模型原生多模态（V4-exp 起默认成立） 或 已开启视觉引擎增强 */
 const canPasteImage = computed(() => modelHasNativeVision.value || multimodalEnabled.value);
-/** 输入框占位提示：纯文本模型未配置视觉引擎时明确提示 */
+/** 输入框占位提示：原生多模态直接贴图；纯文本历史型号才提示配视觉引擎 */
 const inputPlaceholder = computed(() =>
   canPasteImage.value
-    ? "输入您的问题...可粘贴图片、右键添加文件到上下文"
-    : "这是纯文本模型，请配置视觉引擎后再粘贴图片；输入您的问题..."
+    ? "输入您的问题...可粘贴图片（DeepSeek V4-exp 起原生多模态）、右键添加文件到上下文"
+    : "该历史型号为纯文本，请开启「视觉引擎」后再粘贴图片；输入您的问题..."
 );
 
 // Tab 管理
@@ -1936,21 +2048,16 @@ onMounted(async () => {
     } catch (_) {}
   }
   loadInstalledExtensions();
-  // 恢复规则引擎开关（裁决卡片 / 任务契约），写回后端全局配置
+  // 续跑链路：裁决卡片 ❌ 放行后，由本页自动把「继续」发出去
+  store.setResumeRunner(runResume);
+  // 日志落盘位置（安装目录）显示在日志面板头部
+  await refreshLogPath();
+  // 规则引擎开关**由执行许可档位唯一决定**（不交给用户自选）：
+  //   需逐步确认 / 仅确认风险操作 → 规则引擎所有开关全开；
+  //   全流程开放 → 规则引擎所有开关全关，所有操作永久放行。
   try {
-    const saved = JSON.parse(localStorage.getItem("deep-ide-rules-cfg") || "null");
-    if (saved) {
-      rulesDraft.value = {
-        enabled: saved.enabled !== false,
-        turnCardEnabled: !!saved.turnCardEnabled,
-        taskContractEnabled: !!saved.taskContractEnabled,
-      };
-      await tauriAPI.rulesSetToggles({
-        enabled: rulesDraft.value.enabled,
-        turnCardEnabled: rulesDraft.value.turnCardEnabled,
-        taskContractEnabled: rulesDraft.value.taskContractEnabled,
-      });
-    }
+    const linked = await tauriAPI.rulesLinkMode(store.approvalMode);
+    rulesCfg.value = linked.config || rulesCfg.value;
   } catch (_) {}
   // 恢复已落盘的回合裁决卡片（重启后仍可跨回合补裁）
   await store.loadTurnCards();
@@ -2046,7 +2153,11 @@ async function manualCheckUpdate() {  closeDropdowns();
 }
 
 // ─── 基础导航 ───
-function toggleDropdown(n: string) { openDropdown.value = openDropdown.value === n ? "" : n; }
+function toggleDropdown(n: string) {
+  openDropdown.value = openDropdown.value === n ? "" : n;
+  // 打开日志面板时刷新落盘路径（跨天会新建文件）
+  if (openDropdown.value === "agentLogs") void refreshLogPath();
+}
 function closeDropdowns() { openDropdown.value = ""; }
 function goNewProject() { closeDropdowns(); emit("navigate", "new-project"); }
 function goOpenProject() { closeDropdowns(); emit("navigate", "open-project"); }
@@ -2628,7 +2739,7 @@ function msgClass(r: string) { return { "user-message": r === "user", "ai-messag
 async function handleSend() {
   // 有粘贴图片：先经视觉引擎识别，再连问题一起发送（无文本也可用默认问题）
   if (store.pastedImages.length > 0) {
-    if (!canPasteImage.value) { alert("这是纯文本模型，请配置视觉引擎后再使用图片。"); return; }
+    if (!canPasteImage.value) { alert("当前填写的是历史纯文本型号，请开启「视觉引擎」增强，或把 Model 换成 DeepSeek V4 系列（原生多模态）。"); return; }
     const q = chatInput.value.trim();
     chatInput.value = "";
     if (aiInputRef.value) aiInputRef.value.style.height = "auto";
@@ -2648,6 +2759,21 @@ async function handleSend() {
   } else {
     await store.sendMessageStream(t, ctxPaths);
   }
+  nextTick(() => { if (aiChatRef.value) aiChatRef.value.scrollTop = aiChatRef.value.scrollHeight; });
+}
+
+/**
+ * 续跑：用户在裁决卡片上选择 ❌ 放行后，自动把「继续」发出去，Agent 接着跑。
+ * 复用同一条发送链路（文件树刷新 / 上下文 / 日志 / 看门狗），不另起一套逻辑。
+ */
+async function runResume(op: any) {
+  if (!store.useTools) {
+    store.addSystemMessage("已放行该操作，但当前是对话模式（未勾选工具）：请重新勾选「工具」后让我继续。");
+    return;
+  }
+  const ctxPaths = aiContextFiles.value.map((f: any) => f.path);
+  aiContextFiles.value = [];
+  await store.sendMessageWithTools("继续", ctxPaths, undefined, undefined, op);
   nextTick(() => { if (aiChatRef.value) aiChatRef.value.scrollTop = aiChatRef.value.scrollHeight; });
 }
 
@@ -2776,8 +2902,8 @@ async function reloadOpenTabs() {
 
 /**
  * 粘贴图片：
- * - 模型原生支持多模态，或已开启视觉引擎 → 读剪贴板图片 → 存临时文件 → 加入待发送图片（最多 6 张）
- * - 纯文本模型且未配置视觉引擎 → 拦截并提示"请配置视觉引擎使用"
+ * - DeepSeek V4-exp 起原生多模态（或已开启视觉引擎增强）→ 读剪贴板图片 → 存临时文件 → 加入待发送图片（最多 6 张）
+ * - 仅历史纯文本型号（且未开启视觉引擎）→ 拦截并提示开启视觉引擎
  */
 async function onPasteImage(e: ClipboardEvent) {
   const items = e.clipboardData?.items; if (!items) return;
@@ -2789,11 +2915,12 @@ async function onPasteImage(e: ClipboardEvent) {
   }
   if (imageItems.length === 0) return;
 
-  // 纯文本模型 + 未开启视觉引擎：明确提示
+  // 历史纯文本型号 + 未开启视觉引擎：明确提示
   if (!canPasteImage.value) {
     e.preventDefault();
-    alert("这是纯文本模型，请配置视觉引擎使用：\n\n打开「AI配置」→ 勾选「视觉引擎」→ 填写 Vision API Key / Base URL / Model。\n配置后粘贴的图片会先由视觉引擎转译为文本，再交给主模型推理。");
-    store.appendLog("system", "粘贴图片被拦截：纯文本模型且未配置视觉引擎");
+    alert("当前填写的是历史纯文本型号，请开启视觉引擎增强：\n\n打开「AI 配置」→ 勾选「视觉引擎」→ 填写 Vision API Key / Base URL / Model。\n" +
+      "或者把 Model 换成 DeepSeek V4 系列（deepseek-flash / deepseek-chat / deepseek-reasoner）——DeepSeek 自 V4-exp 起原生支持多模态，图片可直接识别。");
+    store.appendLog("system", "粘贴图片被拦截：历史纯文本型号且未开启视觉引擎");
     return;
   }
 
@@ -2864,9 +2991,9 @@ function toggleMaxMode(e: Event) {
 function toggleMultimodal(e: Event) {
   multimodalEnabled.value = (e.target as HTMLInputElement).checked;
   localStorage.setItem("deep-ide-multimodal", JSON.stringify(multimodalEnabled.value));
-  store.addSystemMessage(multimodalEnabled.value ? "已开启视觉引擎（识图）" : "已切换为纯文本模式");
-  store.appendLog("mode", multimodalEnabled.value ? "开启视觉引擎（识图）" : "关闭视觉引擎，切换为纯文本模式");
-  // 纯文本模型 + 未配置视觉引擎：提示需要搭配视觉引擎使用
+  store.addSystemMessage(multimodalEnabled.value ? "已开启视觉引擎增强（OCR / 表格 / 公式）" : "已关闭视觉引擎增强（原生多模态识图不受影响）");
+  store.appendLog("mode", multimodalEnabled.value ? "开启视觉引擎增强（OCR/表格/公式）" : "关闭视觉引擎增强（DeepSeek 原生多模态仍在）");
+  // 视觉引擎是可选增强；只有历史纯文本型号才必须依赖它
   if (multimodalEnabled.value && visionKeyInput.value.trim() === "" && !modelHasNativeVision.value) {
     alert("已开启视觉引擎，但尚未填写 Vision API Key。\n请填写下方「视觉引擎」配置（引擎 / Vision API Key / Base URL / Model）后点击「保存视觉引擎」。");
   }
@@ -3156,18 +3283,22 @@ function toggleFolder(entry: any) { entry.expanded = !entry.expanded; }
 .skin-import-msg { margin-top: 0.4rem; font-size: 0.74rem; color: #27ae60; line-height: 1.5; }
 .skin-import-msg.error { color: #e74c3c; }
 
-/* ─── 执行许可审批卡片（需分步确认模式，对标 Harness 审批门）─── */
+/* ─── 执行许可审批卡片（需逐步确认 / 仅确认风险操作，对标 Harness 审批门）───
+   语义色与裁决卡片一致：❌ 放行 = 红，✅ 拦截 = 绿。 */
 #aiChatPanel { position: relative; }
-.tool-approval-overlay { position: absolute; left: 0; right: 0; bottom: 0; top: 0; background: rgba(255,255,255,0.78); backdrop-filter: blur(2px); display: flex; align-items: flex-end; justify-content: center; padding: 1rem; z-index: 60; }
-.tool-approval-card { width: 100%; max-width: 420px; background: #fff; border: 1px solid #f1c40f; border-radius: 10px; box-shadow: 0 8px 28px rgba(0,0,0,0.18); padding: 0.9rem 1rem; }
-.tool-approval-head { font-size: 0.85rem; font-weight: 600; color: #333; margin-bottom: 0.45rem; }
-.tool-approval-mode { display: inline-block; background: #fff7e0; color: #b8860b; border: 1px solid #f1c40f; border-radius: 10px; padding: 0 0.45rem; font-size: 0.7rem; font-weight: 500; margin-left: 0.35rem; vertical-align: middle; }
-.tool-approval-name { font-size: 0.9rem; font-weight: 600; color: #0b3d91; margin-bottom: 0.4rem; word-break: break-all; }
-.tool-approval-args { background: #f7f7f8; border: 1px solid #eee; border-radius: 6px; padding: 0.5rem 0.6rem; font-size: 0.72rem; color: #555; max-height: 160px; overflow: auto; white-space: pre-wrap; word-break: break-all; margin-bottom: 0.7rem; }
+.tool-approval-overlay { position: absolute; left: 0; right: 0; bottom: 0; top: 0; background: rgba(17,24,39,0.32); backdrop-filter: blur(3px); display: flex; align-items: flex-end; justify-content: center; padding: 1rem; z-index: 60; }
+.tool-approval-card { width: 100%; max-width: 460px; background: #fff; border: 1px solid #e6e9ef; border-radius: 14px; box-shadow: 0 16px 44px rgba(16,24,40,0.22); padding: 1rem 1.1rem; }
+.tool-approval-head { font-size: 0.88rem; font-weight: 600; color: #1f2937; margin-bottom: 0.5rem; display: flex; align-items: center; gap: 0.4rem; flex-wrap: wrap; }
+.tool-approval-mode { display: inline-block; background: #eef4ff; color: #1a56b8; border: 1px solid #cfdffb; border-radius: 999px; padding: 0.05rem 0.5rem; font-size: 0.68rem; font-weight: 600; }
+.tool-approval-name { font-size: 0.92rem; font-weight: 600; color: #0b3d91; margin-bottom: 0.42rem; word-break: break-all; }
+.tool-approval-args { background: #f8f9fb; border: 1px solid #eef1f5; border-radius: 8px; padding: 0.55rem 0.65rem; font-size: 0.72rem; color: #4e5969; max-height: 160px; overflow: auto; white-space: pre-wrap; word-break: break-all; margin-bottom: 0.7rem; }
 .tool-approval-actions { display: flex; gap: 0.5rem; }
-.tool-approval-btn { flex: 1; border: none; border-radius: 7px; padding: 0.5rem 0; font-size: 0.85rem; font-weight: 600; cursor: pointer; }
-.tool-approval-btn.allow { background: #27ae60; color: #fff; }
-.tool-approval-btn.allow:hover { background: #219653; }
-.tool-approval-btn.deny { background: #e74c3c; color: #fff; }
-.tool-approval-btn.deny:hover { background: #d84332; }
+.tool-approval-btn { flex: 1; border: none; border-radius: 9px; padding: 0.55rem 0; font-size: 0.85rem; font-weight: 600; cursor: pointer; transition: all 0.15s; }
+/* ❌ 放行（approved = true）：放行该操作，前端自动回「继续」 */
+.tool-approval-btn.allow { background: #d92d20; color: #fff; }
+.tool-approval-btn.allow:hover { background: #b42318; }
+/* ✅ 拦截（approved = false）：拦下该操作，模型换方案 */
+.tool-approval-btn.block { background: #067647; color: #fff; }
+.tool-approval-btn.block:hover { background: #05603a; }
+.tool-approval-note { margin-top: 0.5rem; font-size: 0.7rem; line-height: 1.6; color: #8b939f; }
 </style>

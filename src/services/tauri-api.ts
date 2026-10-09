@@ -115,6 +115,40 @@ export interface TurnCard {
   verdict: string;
   at: number;
 }
+
+// ─── 待决规则裁决（裁决卡片 ❌ 放行 → 一次性放行 → 自动「继续」）───
+export interface PendingOp {
+  run_id: string;
+  i: number;
+  tool: string;
+  op_type: string;
+  path: string;
+  /** 被拦调用的完整参数 JSON（续跑时原样重放该调用） */
+  args_full: string;
+  /** 参数摘要（≤80 字符，卡片展示用） */
+  args: string;
+  reason: string;
+  err_id: string;
+  resolved: boolean;
+  allowed: boolean;
+  at: number;
+}
+export interface ResolvePendingResult extends PendingOp {
+  has_continue: boolean;
+}
+export interface ContinueResult {
+  has_continue: boolean;
+  op: PendingOp | null;
+}
+/** 执行许可档位 ↔ 规则引擎开关联动结果 */
+export interface ModeLinkResult {
+  mode: string;
+  label: string;
+  rule_engine_on: boolean;
+  turn_card_on: boolean;
+  gate_every_call: boolean;
+  config: any;
+}
 export interface CompressResult {
   before_tokens: number;
   after_tokens: number;
@@ -150,6 +184,7 @@ export const tauriAPI = {
   sendAIMessageStream: (mode: string, message: string, history: Message[], contextPaths: string[]) => invoke<{content:string;mode:string}>("send_ai_message_stream", { mode, message, history, contextPaths }),
 
   // ─── Agent Loop with Tools（Claude Code / Cursor 风格）───
+  /** 续跑上下文：用户在裁决卡片上选择 ❌ 放行后，自动回「继续」时携带 */
   sendAIMessageWithTools: (
     mode: string,
     message: string,
@@ -159,6 +194,14 @@ export const tauriAPI = {
     approvalMode: string = "step",
     contextLimit?: number,
     autoCompress: boolean = false,
+    resumeContext?: {
+      run_id: string;
+      tool: string;
+      op_type?: string;
+      path?: string;
+      args?: string;
+      block_index?: number;
+    } | null,
   ) =>
     invoke<AgentLoopResult>(
       "send_ai_message_with_tools",
@@ -168,6 +211,7 @@ export const tauriAPI = {
         approvalMode,
         contextLimit: contextLimit ?? null,
         autoCompress,
+        resumeContext: resumeContext ?? null,
       }
     ),
   // 应答一次工具调用审批（需分步确认模式；approvalId 来自 tool_approval_required 事件）
@@ -300,6 +344,24 @@ export const tauriAPI = {
     invoke<TurnCard>("rules_attach_turn_card", { key, messageId }),
   rulesLabels: () => invoke<{ labels: { fingerprint: string; label: string; at: number; expires_at: number }[] }>("rules_labels"),
   rulesFingerprint: (command: string) => invoke<{ fingerprint: string | null }>("rules_fingerprint", { command }),
+  /** 执行许可档位 → 规则引擎开关联动（开关不由用户自选） */
+  rulesLinkMode: (mode: string) => invoke<ModeLinkResult>("rules_link_mode", { mode }),
+  /** 试算某工具调用是否属于「风险操作」（仅确认风险操作档位口径） */
+  rulesIsRisk: (tool: string, args?: any) => invoke<{ risk: boolean }>("rules_is_risk", { tool, arguments: args ?? null }),
+  /** 卡片裁决：❌ 放行（approved=true）/ ✅ 拦截（approved=false） */
+  rulesResolvePending: (runId: string, blockIndex: number, approved: boolean) =>
+    invoke<ResolvePendingResult>("rules_resolve_pending", { runId, blockIndex, approved }),
+  /** 取走「待继续」标记（Agent 跑完后调用一次：需要则自动回「继续」再跑一轮） */
+  rulesTakeContinue: (runId: string) => invoke<ContinueResult>("rules_take_continue", { runId }),
+  /** 待决裁决队列状态（只读） */
+  rulesPendingState: (runId: string) => invoke<any>("rules_pending_state", { runId }),
+
+  // ─── 运行时日志（实时落盘到用户本机安装目录，随时可查）───
+  runtimeLogWrite: (level: string, scope: string, message: string) =>
+    invoke<boolean>("runtime_log_write", { level, scope, message }),
+  runtimeLogStatus: () => invoke<{ dir: string; file: string; exists: boolean; size: number }>("runtime_log_status"),
+  runtimeLogTail: (lines?: number) => invoke<{ text: string; path: string }>("runtime_log_tail", { lines: lines ?? null }),
+  runtimeLogOpenDir: () => invoke<string>("runtime_log_open_dir"),
 
   // ─── 费用统计（dsh-cost-meter 移植）───
   costSnapshot: () => invoke<Record<string, any>>("cost_snapshot"),

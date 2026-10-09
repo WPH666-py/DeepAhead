@@ -1,6 +1,6 @@
 import { defineStore, acceptHMRUpdate } from "pinia";
 import { ref, computed } from "vue";
-import { tauriAPI, type ModeInfo, type Message, type AgentDef, type FileEntry, type TurnCard } from "../services/tauri-api";
+import { tauriAPI, type ModeInfo, type Message, type AgentDef, type FileEntry, type TurnCard, type PendingOp } from "../services/tauri-api";
 import type { EditorTheme } from "../utils/codemirror";
 import { applySkin, type SkinVariant } from "../utils/skins";
 
@@ -12,6 +12,47 @@ function newMsgId(): string {
   return `m_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
 }
 
+// ─── 执行许可三档（规则引擎开关由档位唯一决定，不交给用户自选）───
+export type ApprovalModeId = "step" | "risk" | "open";
+export interface ApprovalModeMeta {
+  id: ApprovalModeId;
+  label: string;
+  desc: string;
+  /** 该档位下规则引擎是否全开 */
+  ruleEngineOn: boolean;
+  /** 该档位下是否每一个工具调用都要用户确认 */
+  gateEveryCall: boolean;
+}
+export const APPROVAL_MODES: ApprovalModeMeta[] = [
+  {
+    id: "step",
+    label: "需逐步确认",
+    desc: "每一步工具调用都先查给你看：规则引擎所有开关全开。",
+    ruleEngineOn: true,
+    gateEveryCall: true,
+  },
+  {
+    id: "risk",
+    label: "仅确认风险操作",
+    desc: "规则引擎所有开关全开，只有风险操作（写盘 / 命令 / 删除 / 推送）才查给你看。",
+    ruleEngineOn: true,
+    gateEveryCall: false,
+  },
+  {
+    id: "open",
+    label: "全流程开放",
+    desc: "规则引擎所有开关全关，所有操作永久放行，Agent 一路自主跑完。",
+    ruleEngineOn: false,
+    gateEveryCall: false,
+  },
+];
+export function normalizeApprovalMode(v: string | null | undefined): ApprovalModeId {
+  return v === "risk" || v === "open" || v === "step" ? v : "step";
+}
+export function approvalModeLabel(id: string): string {
+  return APPROVAL_MODES.find(m => m.id === id)?.label || id;
+}
+
 // ─── 日志（"日志"面板数据源）───
 export type LogKind = "mode" | "question" | "answer" | "tool" | "system" | "context";
 export interface LogEntry {
@@ -20,6 +61,12 @@ export interface LogEntry {
   kind: LogKind;
   title: string;
   detail?: string;
+}
+
+/** 日志级别：失败 / 危险 → warn，其余 → info（磁盘日志按级别标注） */
+function logLevelOf(kind: LogKind, title: string): "info" | "warn" {
+  if (kind === "system" && /(失败|错误|拦截|拒绝|超时|异常|error|failed)/i.test(title)) return "warn";
+  return "info";
 }
 
 // ─── 上下文占用 ───
@@ -84,11 +131,22 @@ export const useAppStore = defineStore("app", () => {
   const contextPercent = computed(() => Math.round(contextRatio.value * 1000) / 10);
 
   // ─── 日志：模式切换 / 每轮提问与回复 / 工具调用 / 操作过程 ───
+  // 每条记录都**实时落盘**到用户本机安装目录（%LOCALAPPDATA%\DeepAhead\logs），
+  // 用户不打开面板也能随时查看、复现、报障。
   const sessionLogs = ref<LogEntry[]>([]);
   function appendLog(kind: LogKind, title: string, detail?: string) {
     sessionLogs.value.push({ id: newMsgId(), ts: Date.now(), kind, title, detail });
     // 防止无限增长（保留最近 2000 条）
     if (sessionLogs.value.length > 2000) sessionLogs.value.splice(0, sessionLogs.value.length - 2000);
+    // 实时落盘（失败静默：日志是旁路，不能影响主流程）
+    void writeLogToDisk(logLevelOf(kind, title), kind, title, detail);
+  }
+  /** 把一条日志追加到磁盘日志文件（Tauri 环境外静默跳过，便于纯浏览器预览） */
+  async function writeLogToDisk(level: "info" | "warn", kind: string, title: string, detail?: string) {
+    try {
+      const msg = detail ? `${title}\n${detail}` : title;
+      await tauriAPI.runtimeLogWrite(level, `frontend/${kind}`, msg);
+    } catch (_) { /* 非 Tauri 环境或写盘失败：忽略 */ }
   }
   function clearLogs() { sessionLogs.value = []; }
 
@@ -103,19 +161,60 @@ export const useAppStore = defineStore("app", () => {
   function turnCardForMessage(messageId: string): TurnCard | undefined {
     return Object.values(turnCards.value).find(c => c.message_id === messageId);
   }
-  /** 登记判例（一次性）：✅ 拦对了 / ❌ 拦错了 */
+  /**
+   * 回合裁决卡片：用户只回答一次。
+   *   - **❌ 放行**（verdict="incorrect"）：登记一次性放行 → Agent 继续跑
+   *     （循环还在等着就地续跑；循环已结束则自动回复「继续」再跑一轮）。
+   *   - **✅ 拦截**（verdict="correct"）：拦住该操作，Agent 换方案或先向你确认。
+   */
   async function rateTurnCard(key: string, blockIndex: number, verdict: "correct" | "incorrect") {
+    const card = turnCards.value[key];
+    const blk = card?.blocks.find(b => b.i === blockIndex);
+    const runId = card?.session_id || "";
+    const approve = verdict === "incorrect";
     try {
-      const card = await tauriAPI.rulesRateTurnCard(key, blockIndex, verdict);
-      turnCards.value = { ...turnCards.value, [card.key]: card };
-      const blk = card.blocks.find(b => b.i === blockIndex);
-      appendLog(
-        "system",
-        verdict === "correct" ? "判例登记：拦对了" : "判例登记：拦错了（同类命令学习放行 7 天）",
-        blk ? `规则 ${blk.rule_id}｜${blk.tool}：${blk.args}` : undefined
-      );
+      const saved = await tauriAPI.rulesRateTurnCard(key, blockIndex, verdict);
+      turnCards.value = { ...turnCards.value, [saved.key]: saved };
+      // 语义映射到后端待决队列：❌ = 放行，✅ = 拦截
+      // 后端返回的 PendingOp 带有被拦调用的**完整参数**，续跑据此原样重放该调用。
+      let resolvedOp: PendingOp | null = null;
+      try {
+        resolvedOp = await tauriAPI.rulesResolvePending(runId, blockIndex, approve);
+      } catch (e) {
+        // 记录找不到（例如重启后补裁、或本轮没有硬门记录）不算失败，只记日志
+        appendLog("system", "放行登记未命中待决队列（不影响判定）", String(e));
+      }
+      if (approve) {
+        resumeCtx = resolvedOp || {
+          run_id: runId,
+          i: blockIndex,
+          tool: blk?.tool || "",
+          op_type: "",
+          path: "",
+          args_full: "",
+          args: blk?.args || "",
+          reason: blk?.reason || "",
+          err_id: blk?.err_id || "",
+          resolved: true,
+          allowed: true,
+          at: Date.now(),
+        };
+        appendLog(
+          "system",
+          `❌ 放行该操作（${blk?.tool || "工具"}）`,
+          "规则引擎已登记一次性放行；Agent 正在继续，循环已结束时会自动回复「继续」。"
+        );
+      } else {
+        appendLog(
+          "system",
+          `✅ 拦截该操作（${blk?.tool || "工具"}）`,
+          blk ? `规则 ${blk.rule_id}｜${blk.reason}` : undefined
+        );
+      }
+      // 循环已经结束 → 立刻把「继续」发出去
+      if (!isLoading.value) void flushResume();
     } catch (e: any) {
-      addSystemMessage(`判例登记失败: ${e}`);
+      addSystemMessage(`裁决登记失败: ${e}`);
     }
   }
   /** 载入已落盘的裁决卡片（重启后仍可跨回合补裁） */
@@ -141,26 +240,96 @@ export const useAppStore = defineStore("app", () => {
   const agentMaxIterations = ref(0);
   const useTools = ref<boolean>(true); // 是否启用工具调用（Claude Code 模式）
 
-  // ─── 执行许可模式（对标 Harness 审批；开启工具后新增）───
-  // "step" = 需分步确认；"open" = 全流程开放
-  const approvalMode = ref<string>((localStorage.getItem("deepahead-approval-mode") as string) || "step");
+  // ─── 执行许可三档（对标 Harness 审批；规则引擎开关由档位唯一决定，不交给用户自选）───
+  //  "step" = 需逐步确认      → 规则引擎全开 + 每一步都查看（每个工具调用都弹卡片）
+  //  "risk" = 仅确认风险操作  → 规则引擎全开，只对风险操作弹卡片
+  //  "open" = 全流程开放      → 规则引擎所有开关全关，所有操作永久放行
+  const approvalMode = ref<ApprovalModeId>(
+    normalizeApprovalMode(localStorage.getItem("deepahead-approval-mode"))
+  );
+  /**
+   * 切换执行许可档位：本地持久化 + **后端联动规则引擎开关**。
+   * 用户只选档位，规则引擎的开关由档位唯一决定（全流程开放 = 全关 + 永久放行）。
+   */
   function setApprovalMode(mode: string) {
-    approvalMode.value = mode;
-    localStorage.setItem("deepahead-approval-mode", mode);
+    const m = normalizeApprovalMode(mode);
+    approvalMode.value = m;
+    localStorage.setItem("deepahead-approval-mode", m);
+    const meta = APPROVAL_MODES.find(x => x.id === m);
+    appendLog("mode", `执行许可 → ${meta?.label || m}`, meta?.desc);
+    tauriAPI.rulesLinkMode(m)
+      .then(r => {
+        appendLog(
+          "system",
+          `规则引擎已由「${r.label || meta?.label}」档位接管`,
+          `引擎 ${r.rule_engine_on ? "全开" : "全关（永久放行）"}｜裁决卡片 ${r.turn_card_on ? "开" : "关"}｜逐调用审批 ${r.gate_every_call ? "开" : "关"}`
+        );
+      })
+      .catch(e => console.warn("[DeepAhead] 规则引擎联动失败:", e));
   }
-  // 等待用户批准的当前工具调用（需分步确认模式）
+  // 等待用户批准的当前工具调用（需逐步确认 / 仅确认风险操作档位）
   const pendingApproval = ref<{ approvalId: string; toolId: string; name: string; arguments: any } | null>(null);
-  // 前端应答：允许 / 拒绝该工具调用
+  /**
+   * 前端应答：❌ 放行（approved=true）/ ✅ 拦截（approved=false）。
+   * 后端随后把结果回灌给模型，Agent 继续跑。
+   */
   async function respondApproval(approved: boolean) {
     const p = pendingApproval.value;
     if (!p) return;
     pendingApproval.value = null;
     try {
       await tauriAPI.respondToolApproval(p.approvalId, approved);
+      appendLog(
+        "tool",
+        approved ? `❌ 已放行 ${p.name}（自动回复「继续」）` : `✅ 已拦截 ${p.name}`,
+        formatLogArgs(p.arguments)
+      );
     } catch (e: any) {
       addSystemMessage(`审批应答失败: ${e}`);
       pendingApproval.value = null;
     }
+  }
+
+  // ─── 裁决卡片 → 放行 → 自动继续（续跑队列）───
+  /** 待续跑的操作（用户在卡片上选择 ❌ 放行后登记） */
+  let resumeCtx: PendingOp | null = null;
+  /**
+   * 续跑执行器：由 EditorPage 注册。
+   * 之所以用回调而不是直接调 sendMessageWithTools：续跑必须复用发送链路
+   * （文件树刷新 / 上下文路径 / 日志 / 看门狗），不能另起一套。
+   */
+  let resumeRunner: ((op: PendingOp | null) => Promise<void>) | null = null;
+  function setResumeRunner(fn: (op: PendingOp | null) => Promise<void>) {
+    resumeRunner = fn;
+  }
+  /** 是否有待续跑的操作 */
+  function hasPendingResume(): boolean {
+    return resumeCtx !== null;
+  }
+  /**
+   * Agent 跑完后调用：把「待续跑」变成真正的一轮「继续」。
+   * 返回 true 表示已接管续跑（调用方不要再重复触发）。
+   */
+  async function flushResume(): Promise<boolean> {
+    if (isLoading.value) return false;
+    const op = resumeCtx;
+    if (!op) return false;
+    resumeCtx = null;
+    appendLog(
+      "system",
+      "❌ 已放行，自动回复「继续」",
+      `规则引擎写入一次性放行：${op.tool}${op.path ? " → " + op.path : ""}`
+    );
+    if (!resumeRunner) {
+      appendLog("system", "续跑执行器未注册：请手动回复「继续」");
+      return false;
+    }
+    try {
+      await resumeRunner(op);
+    } catch (e: any) {
+      appendLog("system", "续跑失败", String(e));
+    }
+    return true;
   }
 
   // 文件树
@@ -280,7 +449,8 @@ export const useAppStore = defineStore("app", () => {
     content: string,
     contextPaths: string[] = [],
     workingDir?: string,
-    requestOverride?: string
+    requestOverride?: string,
+    resumeOp?: PendingOp | null
   ) {
     if (!content.trim()) return;
     if (!apiKey.value) {
@@ -316,9 +486,28 @@ export const useAppStore = defineStore("app", () => {
       /函数|class|接口|\bapi\b/, /\bprogram|\bscript/
     ];
     const isCodeRequest = codeGenPatterns.some(p => p.test(content.toLowerCase()));
+    // 续跑轮：明确告诉模型"用户已放行，立刻用同样的工具与参数重试"，并带上续跑上下文
+    const resumeContext = resumeOp?.tool
+      ? {
+          run_id: resumeOp.run_id,
+          tool: resumeOp.tool,
+          op_type: resumeOp.op_type,
+          path: resumeOp.path,
+          args: resumeOp.args_full,
+          block_index: resumeOp.i,
+        }
+      : null;
+    const resumeDirective = resumeOp?.tool
+      ? `[System] 用户在回合裁决卡片上选择了 ❌ 放行，规则引擎已为下面这个调用登记**一次性放行**：\n` +
+        `- 工具：\`${resumeOp.tool}\`\n` +
+        (resumeOp.path ? `- 路径：\`${resumeOp.path}\`\n` : "") +
+        (resumeOp.op_type ? `- 操作类型：${resumeOp.op_type}\n` : "") +
+        `请**立即重新发起同一个调用**（工具名与参数保持一致，以便消费这次一次性放行），不要再向用户请示；` +
+        `放行成功后继续完成原任务。若该操作已不再必要，直接说明原因并给出最终结论。`
+      : "";
     const requestContent = requestOverride
-      ?? (isCodeRequest
-        ? content
+      ?? (isCodeRequest || resumeOp?.tool
+        ? (resumeDirective ? `${content}\n\n${resumeDirective}` : content)
         : `${content}\n\n[System] 本次请求不涉及代码生成。请把回答整理成 Markdown 文档并保存到工作区，文件名要反映主题。最终回复中只给出文件路径和简要说明，不要输出大段正文。`);
 
     // 防"思考中"卡死：事件后若 IPC 在超时内未返回，强制恢复界面
@@ -507,6 +696,11 @@ export const useAppStore = defineStore("app", () => {
       appendLog("system", `❌ Agent Loop 失败`, String(e));
     } finally {
       isLoading.value = false;
+      // 本轮有被拦记录 + 用户已选择 ❌ 放行 → 自动回复「继续」，Agent 接着跑
+      if (resumeCtx) {
+        try { unlisten(); } catch (_) {}
+        void flushResume();
+      }
     }
   }
 
@@ -798,6 +992,8 @@ export const useAppStore = defineStore("app", () => {
     runIdForMsg, removeMessagesFrom, clearRunIdsFrom,
     toolCalls, agentIterations, agentMaxIterations, useTools,
     approvalMode, setApprovalMode, pendingApproval, respondApproval,
+    /** 续跑链路：EditorPage 注册执行器，Agent 跑完后自动把「继续」发出去 */
+    setResumeRunner, flushResume, hasPendingResume,
     setEditorTheme,
     skinId, skinVariant, setSkin,
     checkSafety,
