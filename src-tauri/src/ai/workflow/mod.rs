@@ -222,6 +222,9 @@ pub fn clone_for_phase(input: &AgentLoopInput) -> AgentLoopInput {
         memory: input.memory.clone(),
         // 工具超时沿用主运行（阶段不该比主循环更放任）
         tool_timeout_secs: input.tool_timeout_secs,
+        // 取消信号与心跳标签一并继承：阶段子循环同样要能被停掉
+        cancel: input.cancel.clone(),
+        heartbeat_label: input.heartbeat_label.clone(),
     }
 }
 

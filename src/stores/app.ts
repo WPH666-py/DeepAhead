@@ -588,10 +588,12 @@ export const useAppStore = defineStore("app", () => {
               t.status = "running";
               t.elapsedSecs = secs;
             }
+            // 嵌套层级（子智能体）会带 label，用它区分"谁在跑"
+            const who = String(k.label || "").trim();
             appendLog(
               "tool",
-              `⏳ ${k.name} 仍在执行（${secs}s）`,
-              "长任务属正常；若长时间无进展可点日志里的工具条目查看参数。"
+              `⏳ ${k.name}${who ? `（${who}）` : ""} 仍在执行（${secs}s）`,
+              "长任务属正常；单个工具超过 5 分钟会被自动中止并交还给模型。"
             );
           } else if (k.type === "tool_call_executed") {
             const tc = toolCalls.value.find(t => t.id === k.id);

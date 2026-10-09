@@ -98,19 +98,32 @@ pub struct ToolRegistry {
     undo_sink: Option<(String, Arc<UndoStore>)>,
     /// 可选的子智能体执行器（None 时 subagents 工具报“不可用”）
     subagent_executor: Option<SubagentExecutor>,
+    /// 单个子智能体的墙钟上限（秒）；0 = 用默认值
+    subagent_timeout_secs: u64,
 }
 
 impl ToolRegistry {
     pub fn new(working_dir: PathBuf) -> Self {
-        Self { working_dir, undo_sink: None, subagent_executor: None }
+        Self { working_dir, undo_sink: None, subagent_executor: None, subagent_timeout_secs: 0 }
     }
 
     pub fn new_with_undo(working_dir: PathBuf, run_id: String, store: Arc<UndoStore>) -> Self {
-        Self { working_dir, undo_sink: Some((run_id, store)), subagent_executor: None }
+        Self {
+            working_dir,
+            undo_sink: Some((run_id, store)),
+            subagent_executor: None,
+            subagent_timeout_secs: 0,
+        }
     }
 
     pub fn with_subagent_executor(mut self, exec: SubagentExecutor) -> Self {
         self.subagent_executor = Some(exec);
+        self
+    }
+
+    /// 设置单个子智能体的墙钟上限（秒）；0 表示沿用默认值
+    pub fn with_subagent_timeout(mut self, secs: u64) -> Self {
+        self.subagent_timeout_secs = secs;
         self
     }
 
@@ -592,7 +605,41 @@ impl ToolRegistry {
         let Some(exec) = &self.subagent_executor else {
             return ToolResult { success: false, output: "subagents is not available in this context".into(), data: None };
         };
-        let futures: Vec<_> = tasks.iter().map(|(_, instr)| exec(instr.clone())).collect();
+        /*
+         * 每个子智能体**单独设墙钟上限**，而不是只靠父循环的整体超时。
+         *
+         * 原因：这里是 `join_all`，一个子任务卡住会让整批都等不到结果 ——
+         * 界面上就表现为"主流程已经答完了，子智能体还在跑"（用户实测到过）。
+         * 现在单个子任务的预算是父循环工具预算的 3/4（并夹在 [60s, 300s]），
+         * 超时的子任务直接判失败回给模型，其余子任务的结论照常返回。
+         */
+        let per_agent_secs = if self.subagent_timeout_secs == 0 {
+            300
+        } else {
+            (self.subagent_timeout_secs * 3 / 4).clamp(60, 300)
+        };
+        let futures: Vec<_> = tasks
+            .iter()
+            .map(|(id, instr)| {
+                let exec = exec.clone();
+                let instr = instr.clone();
+                let id = id.clone();
+                async move {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(per_agent_secs),
+                        exec(instr),
+                    )
+                    .await
+                    {
+                        Ok(r) => r,
+                        Err(_) => Err(format!(
+                            "子智能体 {} 超过 {}s 未完成，已中止（把任务拆得更小，或直接在主循环里做）",
+                            id, per_agent_secs
+                        )),
+                    }
+                }
+            })
+            .collect();
         let results = futures_util::future::join_all(futures).await;
         let mut lines: Vec<String> = Vec::new();
         let mut ok = 0usize;

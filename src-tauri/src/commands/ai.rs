@@ -350,6 +350,9 @@ pub async fn send_ai_message_with_tools(
         // 单个工具调用的上限：任何工具都不该让整轮 Agent 永久卡死
         // （read_image 曾经因为视觉请求没有超时而挂死一整轮）
         tool_timeout_secs: crate::ai::agent_loop::DEFAULT_TOOL_TIMEOUT_SECS,
+        // 取消信号：父循环超时/中止时用它连带停掉嵌套的子智能体
+        cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        heartbeat_label: String::new(),
     };
 
     // 事件转发到 Tauri：每个 agent 事件触发 ai-agent-event

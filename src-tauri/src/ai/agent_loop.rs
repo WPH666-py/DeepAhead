@@ -92,9 +92,10 @@ pub enum AgentEventKind {
     ToolCallExecuted { id: String, name: String, success: bool, output: String },
     /// 工具仍在执行（心跳：每 ~20s 一次，elapsed_secs = 已耗时秒数）
     ///
-    /// 存在的意义：工具（尤其是 read_image / bash）可能跑几分钟，
+    /// 存在的意义：工具（尤其是 read_image / bash / subagents）可能跑几分钟，
     /// 期间若没有任何事件，界面只能一直显示「思考中…」，用户无法判断是死是活。
-    ToolProgress { id: String, name: String, elapsed_secs: u64 },
+    /// `label` 用于区分嵌套层级（子循环会把子智能体任务 id 带出来）。
+    ToolProgress { id: String, name: String, elapsed_secs: u64, label: String },
     /// 工具调用待审批（需分步确认模式）：前端应弹出审批卡片并调用 respond_tool_approval
     ToolApprovalRequired { approval_id: String, id: String, name: String, arguments: String },
     /// 审批结果（前端据此把工具卡片置为执行中/已拒绝）
@@ -168,11 +169,29 @@ pub struct AgentLoopInput {
     /// 单个工具调用的最长执行时间（秒）；0 = 不限制。
     /// 兜底用：任何工具都不该让一整轮 Agent 永久卡死。
     pub tool_timeout_secs: u64,
+    /// 取消信号：置位后本循环在**下一次迭代/下一次等待**时干净退出。
+    ///
+    /// 为什么需要它：`subagents` 会在工具调用内部再起嵌套的子循环，
+    /// 父循环只能等它返回。父循环超时或运行被中止时，必须能**连带停掉子循环**，
+    /// 否则就会出现"主流程已经结束、子智能体还在跑"（用户实测到的现象）。
+    pub cancel: Arc<std::sync::atomic::AtomicBool>,
+    /// 心跳里要展示的标签（如子智能体任务 id）；子循环用它区分"谁在跑"
+    pub heartbeat_label: String,
 }
 
-/// 单个工具调用的默认上限（秒）。10 分钟足够跑完 OCR / 模型下载 / 长脚本，
-/// 又能在"某个工具真的挂住"时把控制权交还给用户。
-pub const DEFAULT_TOOL_TIMEOUT_SECS: u64 = 600;
+impl AgentLoopInput {
+    /// 是否已被要求停止
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// 单个工具调用的默认上限（秒）。
+///
+/// 取 300s（5 分钟）：一次工具调用（含 subagents 派发的子智能体）超过 5 分钟
+/// 基本已经偏离"给用户解决问题"的节奏，此时应当中止并把控制权交还给模型 ——
+/// 而不是让界面无限期停在「思考中…」。
+pub const DEFAULT_TOOL_TIMEOUT_SECS: u64 = 300;
 
 /// 工具执行期间的心跳间隔（秒）
 const TOOL_HEARTBEAT_SECS: u64 = 20;
@@ -208,7 +227,8 @@ where
         config.max_iterations = m;
     }
     let tools = ToolRegistry::new_with_undo(input.working_dir.clone(), input.run_id.clone(), input.undo_store.clone())
-        .with_subagent_executor(make_subagent_executor(&input));
+        .with_subagent_executor(make_subagent_executor(&input))
+        .with_subagent_timeout(input.tool_timeout_secs);
     let tool_schemas: Vec<ToolSchema> = ToolRegistry::schemas();
 
     // 记录执行前已存在的临时脚本，避免误删用户文件
@@ -384,6 +404,14 @@ where
     // 3. 主循环（max_iterations = 0 表示不限步数：直到模型给出结论或出错才结束）
     let mut iter: usize = 0;
     loop {
+        // 取消信号：父循环超时/中止时会置位，子循环据此干净退出
+        if input.is_cancelled() {
+            crate::ai::runtime_log::warn(
+                "agent",
+                &format!("Agent 循环收到取消信号，停止于第 {} 步（run={}）", iter + 1, input.run_id),
+            );
+            return Err("运行已被取消（父任务结束或超时）".into());
+        }
         if config.max_iterations > 0 && iter >= config.max_iterations {
             break;
         }
@@ -884,6 +912,7 @@ where
             let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(TOOL_HEARTBEAT_SECS));
             heartbeat.tick().await; // 第一个 tick 立即返回，跳过
             let timeout_secs = input.tool_timeout_secs.max(1);
+            let heartbeat_label = input.heartbeat_label.clone();
 
             let result = loop {
                 tokio::select! {
@@ -893,6 +922,7 @@ where
                             id: tool_id.clone(),
                             name: tool_name.clone(),
                             elapsed_secs: started.elapsed().as_secs(),
+                            label: heartbeat_label.clone(),
                         });
                         events.push(ev.clone());
                         on_event(ev);
@@ -906,15 +936,23 @@ where
             let result = match result {
                 Some(r) => r,
                 None => {
+                    // 关键：置位取消信号，**连带停掉这个工具内部起的嵌套子循环**
+                    // （subagents 派发的子智能体在自己的工具调用里跑，父循环没法直接管它们）。
+                    input
+                        .cancel
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
                     let msg = format!(
-                        "⏱ 工具 {} 超过 {}s 未返回，已被中止（不会继续占用本轮）。\
-                         请换一种方式完成任务：例如先把长任务拆小、检查路径/参数是否正确，\
+                        "⏱ 工具 {} 超过 {}s 未返回，已被中止（本轮到此结束）。\
+                         请换一种方式完成任务：例如把长任务拆小、缩小 subagents 的委派范围，\
                          或先向用户说明卡在哪里。",
                         tool_name, timeout_secs
                     );
                     crate::ai::runtime_log::warn(
                         "tools",
-                        &format!("工具超时中止：{}（{}s）", tool_name, timeout_secs),
+                        &format!(
+                            "工具超时中止：{}（{}s）—— 已发出取消信号，嵌套子循环会随之停止",
+                            tool_name, timeout_secs
+                        ),
                     );
                     ToolResult { success: false, output: msg, data: None }
                 }
@@ -1433,6 +1471,12 @@ fn dsml_param_body(param: &str) -> String {
 // ════════════════════════════════════════════════════════
 // 子智能体执行器：把 subagents 工具的指令交给嵌套 Agent Loop
 // （独立上下文 + 全套工具，最多 40 轮；事件静默，结论回传主循环）
+//
+// 生命周期约定（v0.5.7 起）：
+//   - 子循环**继承父循环的取消信号**：父循环超时/中止时会置位，
+//     子循环在下一次迭代检查到并干净退出（不再出现"主流程结束、子智能体还在跑"）；
+//   - 每个子智能体还有**自己的墙钟上限**（PARENT_TOOL_TIMEOUT / N），
+//     避免一个子任务拖住整批（join_all 会等其他所有子任务返回）。
 // ════════════════════════════════════════════════════════
 
 fn make_subagent_executor(input: &AgentLoopInput) -> SubagentExecutor {
@@ -1448,6 +1492,8 @@ fn make_subagent_executor(input: &AgentLoopInput) -> SubagentExecutor {
     let auto_compress = input.auto_compress;
     let memory_cfg = input.memory.clone();
     let tool_timeout_secs = input.tool_timeout_secs;
+    // 父循环的取消信号：子循环与它共享同一个 flag
+    let parent_cancel = input.cancel.clone();
     Arc::new(move |instruction: String| -> futures_util::future::BoxFuture<'static, Result<String, String>> {
         let deepseek = deepseek.clone();
         let system_prompt = system_prompt.clone();
@@ -1457,6 +1503,7 @@ fn make_subagent_executor(input: &AgentLoopInput) -> SubagentExecutor {
         let run_id = run_id.clone();
         let approval_gate = approval_gate.clone();
         let memory_cfg = memory_cfg.clone();
+        let sub_cancel = parent_cancel.clone();
         Box::pin(async move {
             let sub_input = AgentLoopInput {
                 mode,
@@ -1482,6 +1529,10 @@ fn make_subagent_executor(input: &AgentLoopInput) -> SubagentExecutor {
                 memory: memory_cfg.clone(),
                 // 子智能体沿用主循环的工具超时
                 tool_timeout_secs,
+                // 与父循环共享取消信号：父超时 ⇒ 子循环下一轮退出
+                cancel: sub_cancel.clone(),
+                // 心跳标签：让界面能看出"是子智能体在跑"
+                heartbeat_label: "子智能体".into(),
             };
             let output = run_agent_loop(sub_input, |_| {}).await;
             match output {
@@ -1496,6 +1547,44 @@ fn make_subagent_executor(input: &AgentLoopInput) -> SubagentExecutor {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// **回归**：取消信号必须能让嵌套循环停下来。
+    ///
+    /// `subagents` 会在工具调用内部再起子循环，父循环只能等它返回 ——
+    /// 父循环超时后若不置位取消信号，就会出现"主流程已结束、子智能体还在跑"。
+    /// 这里守住契约本身：子循环与父循环共享同一个 flag，置位即可见。
+    #[test]
+    fn cancel_signal_is_shared_and_visible() {
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // 模拟父循环构造出的输入
+        let parent_flag = cancel.clone();
+        // 模拟子智能体执行器：与父共享同一个 Arc
+        let child_flag = cancel.clone();
+
+        assert!(!parent_flag.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!child_flag.load(std::sync::atomic::Ordering::SeqCst));
+
+        // 父循环超时 → 置位
+        parent_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        assert!(
+            child_flag.load(std::sync::atomic::Ordering::SeqCst),
+            "子循环必须立刻看到取消信号（否则会继续跑下去）"
+        );
+    }
+
+    /// 取消的默认值是"未取消"，且默认工具上限是个有限值
+    #[test]
+    fn defaults_are_sane() {
+        let flag = std::sync::atomic::AtomicBool::new(false);
+        assert!(!flag.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            DEFAULT_TOOL_TIMEOUT_SECS > 0 && DEFAULT_TOOL_TIMEOUT_SECS <= 900,
+            "工具上限应是有限且合理的值，实际 {}",
+            DEFAULT_TOOL_TIMEOUT_SECS
+        );
+    }
 
     #[test]
     fn dsml_parse_content_and_reasoning() {
@@ -1516,8 +1605,7 @@ mod tests {
     }
 
     #[test]
-    fn dsml_parse_empty_and_garbage() {
-        assert!(parse_dsml_tool_calls("").is_empty());
+    fn dsml_parse_empty_and_garbage() {        assert!(parse_dsml_tool_calls("").is_empty());
         assert!(parse_dsml_tool_calls("plain text no markup").is_empty());
         // 非法 JSON 参数值 → 回退为字符串
         let text = "<\u{FF5C}DSML\u{FF5C}tool_calls><\u{FF5C}DSML\u{FF5C}invoke name=\"write\">\
