@@ -605,6 +605,35 @@
       </div>
     </div>
 
+    <!-- 一键静默卸载确认框 -->
+    <div class="modal-overlay" :class="{ show: showUninstallModal }" @click.self="showUninstallModal = false">
+      <div class="modal-box" style="width:460px">
+        <div class="modal-header">
+          <h3>卸载 DeepAhead</h3>
+          <button class="modal-close" @click="showUninstallModal = false">&times;</button>
+        </div>
+        <div class="modal-body">
+          <p style="font-size:0.86rem;color:#444;line-height:1.7;margin-bottom:0.8rem">
+            将执行<b>静默卸载</b>（不弹出任何窗口）：
+          </p>
+          <ol style="font-size:0.82rem;color:#555;line-height:1.9;padding-left:1.2rem;margin-bottom:0.9rem">
+            <li>应用立即退出</li>
+            <li>后台无窗口运行卸载程序（<code>uninstall.exe /S</code>）</li>
+            <li>删除安装目录与开始菜单项</li>
+          </ol>
+          <div class="update-hint">
+            项目文件与设置<b>不会被删除</b>（它们在你的工作目录与用户数据目录里）。
+          </div>
+        </div>
+        <div class="form-actions">
+          <button class="btn btn-secondary" :disabled="uninstallBusy" @click="showUninstallModal = false">取消</button>
+          <button class="btn btn-primary" style="background:#e74c3c" :disabled="uninstallBusy" @click="confirmUninstall">
+            {{ uninstallBusy ? '正在启动卸载…' : '确认卸载' }}
+          </button>
+        </div>
+      </div>
+    </div>
+
     <!-- 上下文占用（AI 驾驶舱 · 独立入口，原 AI 配置里的那一块移到这里） -->
     <div class="modal-overlay" :class="{ show: showContextModal }" @click.self="showContextModal = false">
       <div class="modal-box" style="width:520px">
@@ -1124,6 +1153,8 @@ const showGitPushModal = ref(false);
 const showGitHistoryModal = ref(false);
 const showCapModal = ref(false);
 const showContextModal = ref(false);
+const showUninstallModal = ref(false);
+const uninstallBusy = ref(false);
 const showFilePicker = ref(false);
 const showTerminal = ref(false);
 const showImagePreview = ref(false);
@@ -2021,7 +2052,24 @@ function goNewProject() { closeDropdowns(); emit("navigate", "new-project"); }
 function goOpenProject() { closeDropdowns(); emit("navigate", "open-project"); }
 function closeProject() { closeDropdowns(); emit("navigate", "home"); store.currentProject = ""; }
 function exitApp() { closeDropdowns(); invoke("exit_app"); }
-function uninstallApp() { closeDropdowns(); alert("卸载功能请通过系统控制面板操作"); }
+function uninstallApp() {
+  closeDropdowns();
+  showUninstallModal.value = true;
+}
+
+/** 一键静默卸载：确认后启动无窗口辅助脚本，随后退出应用 */
+async function confirmUninstall() {
+  uninstallBusy.value = true;
+  try {
+    const script = await tauriAPI.uninstallNow();
+    store.appendLog("system", "已启动静默卸载（无窗口），应用即将退出", script);
+    showUninstallModal.value = false;
+    setTimeout(() => { tauriAPI.quitForUpdate(); }, 600);
+  } catch (e: any) {
+    uninstallBusy.value = false;
+    alert(`启动卸载失败：${e}`);
+  }
+}
 
 // ─── 运行环境 ───
 async function detectRuntimes() {

@@ -123,6 +123,8 @@ fn main() {
             commands::check_update,
             commands::download_update,
             commands::install_update,
+            commands::uninstall_now,
+            commands::update_helper_log,
             commands::quit_for_update,
         ])
         .run(tauri::generate_context!())

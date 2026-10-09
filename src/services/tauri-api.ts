@@ -230,6 +230,10 @@ export const tauriAPI = {
     invoke<string>("download_update", { url, fileName }),
   /** 启动更新：写游离脚本 → 本进程退出后静默卸载旧版并安装新版 */
   installUpdate: (installerPath: string) => invoke<string>("install_update", { installerPath }),
+  /** 一键静默卸载（无窗口）：本进程退出后静默运行卸载器 */
+  uninstallNow: () => invoke<string>("uninstall_now"),
+  /** 更新/卸载辅助脚本的日志（排查"没反应"） */
+  updateHelperLog: () => invoke<{ path: string; exists: boolean; text: string }>("update_helper_log"),
   /** 立即退出应用（"立即更新"在启动辅助脚本后调用） */
   quitForUpdate: () => invoke<void>("quit_for_update"),
 

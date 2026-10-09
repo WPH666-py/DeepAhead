@@ -982,10 +982,6 @@ pub fn rule_engine_dir() -> PathBuf {
     dsh_home()
 }
 
-fn turn_cards_path_in(base: &Path) -> PathBuf {
-    base.join("rule-engine-turn-cards.json")
-}
-
 static CARD_LOCK: Mutex<()> = Mutex::new(());
 
 fn load_cards() -> Vec<TurnCard> {

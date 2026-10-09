@@ -53,6 +53,26 @@ pub fn install_update(installer_path: String) -> Result<String, String> {
     Ok(script.to_string_lossy().to_string())
 }
 
+/// 一键静默卸载：本进程退出后静默运行卸载器（无窗口）。
+/// 返回辅助脚本路径；调用方随后应立即退出应用。
+#[tauri::command]
+pub fn uninstall_now() -> Result<String, String> {
+    let script = update::launch_uninstaller()?;
+    Ok(script.to_string_lossy().to_string())
+}
+
+/// 更新/卸载辅助脚本的日志路径（供界面显示，便于排查"没反应"）
+#[tauri::command]
+pub fn update_helper_log() -> serde_json::Value {
+    let path = update::helper_log_path();
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    serde_json::json!({
+        "path": path.to_string_lossy().to_string(),
+        "exists": path.exists(),
+        "text": text,
+    })
+}
+
 /// 退出应用（供"立即更新"在启动辅助脚本后调用）
 #[tauri::command]
 pub fn quit_for_update(app: AppHandle) {

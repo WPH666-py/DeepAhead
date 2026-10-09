@@ -181,6 +181,19 @@ pub async fn download_installer(
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建更新目录失败: {}", e))?;
     let dest = dir.join(file_name);
 
+    // 清理上一次下载残留的安装包，避免每次更新都在临时目录里堆一个 100 MB 文件
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for e in entries.flatten() {
+            let p = e.path();
+            let name = e.file_name().to_string_lossy().to_lowercase();
+            let is_installer = name.ends_with(".exe");
+            let is_legacy_helper = name.ends_with(".cmd");
+            if (is_installer || is_legacy_helper) && p != dest {
+                let _ = std::fs::remove_file(&p);
+            }
+        }
+    }
+
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3600))
         .user_agent("DeepAhead-Updater")
@@ -214,12 +227,167 @@ pub async fn download_installer(
     Ok(dest)
 }
 
+/// VBScript 字符串字面量转义（内部的双引号要写成两个）
+fn vbs_str(s: &str) -> String {
+    s.replace('"', "\"\"")
+}
+
+/// 更新/卸载辅助脚本所在目录
+pub fn helper_dir() -> PathBuf {
+    std::env::temp_dir().join("DeepAhead_update")
+}
+
+/// 辅助脚本的日志（无控制台，出问题只能靠它排查）
+pub fn helper_log_path() -> PathBuf {
+    helper_dir().join("update.log")
+}
+
+/// 用 wscript.exe 启动一个**无窗口**的 VBScript。
+///
+/// 为什么不用批处理：
+/// - 之前用 `cmd /C script.cmd` + `DETACHED_PROCESS|CREATE_NO_WINDOW`，
+///   但批处理里的 `tasklist | find`、`timeout`、`start` 会在 Windows 11 上
+///   弹出 Windows Terminal 黑窗（用户实测到标题为 `find "292"` 的窗口）。
+///   而且 `DETACHED_PROCESS` 与 `CREATE_NO_WINDOW` 语义冲突，隐藏并不可靠。
+/// - `wscript.exe` 是 GUI 子系统程序，**从不分配控制台**；配合 `//B`（批处理模式）
+///   连脚本错误弹窗都不会有。内部所有 Run 都用窗口样式 0（隐藏）。
+fn spawn_hidden_vbs(script_name: &str, script: &str) -> Result<PathBuf, String> {
+    let dir = helper_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建辅助目录失败: {}", e))?;
+    let path = dir.join(script_name);
+    // VBScript 需要 UTF-16LE 才能正确读中文路径；这里用 UTF-16LE + BOM 写入
+    let mut bytes: Vec<u8> = vec![0xFF, 0xFE];
+    for unit in script.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    std::fs::write(&path, bytes).map_err(|e| format!("写入辅助脚本失败: {}", e))?;
+
+    use std::os::windows::process::CommandExt;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    std::process::Command::new("wscript.exe")
+        // //B = 批处理模式（无 UI），//Nologo = 不显示版本信息
+        .args(["//B", "//Nologo", &path.to_string_lossy()])
+        .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
+        .spawn()
+        .map_err(|e| format!("启动辅助脚本失败: {}", e))?;
+    Ok(path)
+}
+
+/// VBScript 公共头：等待指定 PID 退出（用 WMI，无控制台）
+fn vbs_header(pid: u32, log: &str) -> String {
+    format!(
+        "Option Explicit\r\n\
+Dim sh, fso, pid, logPath\r\n\
+Set sh = CreateObject(\"WScript.Shell\")\r\n\
+Set fso = CreateObject(\"Scripting.FileSystemObject\")\r\n\
+pid = {pid}\r\n\
+logPath = \"{log}\"\r\n\
+\r\n\
+Sub LogLine(msg)\r\n\
+  Dim f\r\n\
+  On Error Resume Next\r\n\
+  Set f = fso.OpenTextFile(logPath, 8, True)\r\n\
+  f.WriteLine Now & \"  \" & msg\r\n\
+  f.Close\r\n\
+  On Error GoTo 0\r\n\
+End Sub\r\n\
+\r\n\
+Function ProcRunning(p)\r\n\
+  Dim col\r\n\
+  ProcRunning = False\r\n\
+  On Error Resume Next\r\n\
+  Set col = GetObject(\"winmgmts:\\.\\root\\cimv2\").ExecQuery(\"SELECT ProcessId FROM Win32_Process WHERE ProcessId=\" & p)\r\n\
+  If Err.Number = 0 Then\r\n\
+    If col.Count > 0 Then ProcRunning = True\r\n\
+  End If\r\n\
+  On Error GoTo 0\r\n\
+End Function\r\n\
+\r\n\
+Dim waited\r\n\
+waited = 0\r\n\
+Do While ProcRunning(pid) And waited < 600\r\n\
+  WScript.Sleep 1000\r\n\
+  waited = waited + 1\r\n\
+Loop\r\n\
+LogLine \"app exited after \" & waited & \"s\"\r\n",
+        pid = pid,
+        log = vbs_str(log)
+    )
+}
+
+/// 生成更新用的 VBScript 正文（纯函数，便于测试）
+pub fn build_update_script(
+    pid: u32,
+    installer: &str,
+    uninstaller: &str,
+    appexe: &str,
+    log: &str,
+) -> String {
+    format!(
+        "{header}\
+\r\n\
+If fso.FileExists(\"{uninstaller}\") Then\r\n\
+  LogLine \"running uninstaller (silent, hidden)\"\r\n\
+  On Error Resume Next\r\n\
+  sh.Run \"\"\"\" & \"{uninstaller}\" & \"\"\" /S\", 0, True\r\n\
+  LogLine \"uninstaller returned\"\r\n\
+  On Error GoTo 0\r\n\
+Else\r\n\
+  LogLine \"no uninstaller at {uninstaller}\"\r\n\
+End If\r\n\
+\r\n\
+LogLine \"running installer (silent, hidden)\"\r\n\
+On Error Resume Next\r\n\
+sh.Run \"\"\"\" & \"{installer}\" & \"\"\" /S\", 0, True\r\n\
+LogLine \"installer returned\"\r\n\
+On Error GoTo 0\r\n\
+\r\n\
+If fso.FileExists(\"{appexe}\") Then\r\n\
+  LogLine \"relaunching app\"\r\n\
+  sh.Run \"\"\"\" & \"{appexe}\" & \"\"\"\", 1, False\r\n\
+Else\r\n\
+  LogLine \"app exe missing after install: {appexe}\"\r\n\
+End If\r\n\
+\r\n\
+LogLine \"done; self-deleting helper\"\r\n\
+On Error Resume Next\r\n\
+fso.DeleteFile WScript.ScriptFullName, True\r\n\
+On Error GoTo 0\r\n",
+        header = vbs_header(pid, log),
+        uninstaller = vbs_str(uninstaller),
+        installer = vbs_str(installer),
+        appexe = vbs_str(appexe),
+    )
+}
+
+/// 生成卸载用的 VBScript 正文（纯函数，便于测试）
+pub fn build_uninstall_script(pid: u32, uninstaller: &str, log: &str) -> String {
+    format!(
+        "{header}\
+\r\n\
+LogLine \"running uninstaller (silent, hidden)\"\r\n\
+On Error Resume Next\r\n\
+sh.Run \"\"\"\" & \"{uninstaller}\" & \"\"\" /S\", 0, True\r\n\
+LogLine \"uninstaller returned\"\r\n\
+On Error GoTo 0\r\n\
+\r\n\
+LogLine \"done; self-deleting helper\"\r\n\
+On Error Resume Next\r\n\
+fso.DeleteFile WScript.ScriptFullName, True\r\n\
+On Error GoTo 0\r\n",
+        header = vbs_header(pid, log),
+        uninstaller = vbs_str(uninstaller),
+    )
+}
+
 /// 生成并启动"游离"更新脚本：等待本进程退出 → 静默卸载 → 静默安装 → 重启。
 ///
-/// 为什么必须这样做：
+/// 为什么必须交给独立进程：
 /// - 运行中的 exe 被占用，安装程序无法覆盖它；
-/// - 卸载同样不能在进程内做（会把自己的文件删掉）；
-/// - 因此必须交给一个**独立于本进程**的脚本，在本进程退出后串行执行。
+/// - 卸载更不能在进程内做（会删掉自己的文件）。
+///
+/// 全程**无窗口**：wscript.exe + 所有 Run 用窗口样式 0，日志写文件而不是控制台。
 pub fn launch_update_installer(installer: &std::path::Path) -> Result<PathBuf, String> {
     let current_exe = std::env::current_exe().map_err(|e| format!("无法获取当前程序路径: {}", e))?;
     let install_dir = current_exe
@@ -227,52 +395,41 @@ pub fn launch_update_installer(installer: &std::path::Path) -> Result<PathBuf, S
         .ok_or_else(|| "无法获取安装目录".to_string())?
         .to_path_buf();
     let uninstaller = install_dir.join("uninstall.exe");
-    let pid = std::process::id();
+    let log = helper_log_path();
 
-    let script_path = std::env::temp_dir().join("DeepAhead_update").join("deepahead-update.cmd");
-    if let Some(dir) = script_path.parent() {
-        let _ = std::fs::create_dir_all(dir);
+    let script = build_update_script(
+        std::process::id(),
+        &installer.to_string_lossy(),
+        &uninstaller.to_string_lossy(),
+        &current_exe.to_string_lossy(),
+        &log.to_string_lossy(),
+    );
+    spawn_hidden_vbs("deepahead-update.vbs", &script)
+}
+
+/// 一键静默卸载：等待本进程退出 → 静默运行卸载器 → 自删除辅助脚本。
+/// 全程无窗口。返回辅助脚本路径。
+pub fn launch_uninstaller() -> Result<PathBuf, String> {
+    let current_exe = std::env::current_exe().map_err(|e| format!("无法获取当前程序路径: {}", e))?;
+    let install_dir = current_exe
+        .parent()
+        .ok_or_else(|| "无法获取安装目录".to_string())?
+        .to_path_buf();
+    let uninstaller = install_dir.join("uninstall.exe");
+    if !uninstaller.exists() {
+        return Err(format!(
+            "未找到卸载程序：{}\n（可能是免安装/开发模式运行）",
+            uninstaller.to_string_lossy()
+        ));
     }
 
-    // 注意：批处理里的路径都加引号；%~f0 用于自删除
-    let script = format!(
-        "@echo off\r\n\
-chcp 65001 >nul\r\n\
-setlocal\r\n\
-set \"PID={pid}\"\r\n\
-:waitloop\r\n\
-tasklist /FI \"PID eq %PID%\" 2>nul | find \"%PID%\" >nul\r\n\
-if not errorlevel 1 (\r\n\
-  timeout /t 2 /nobreak >nul\r\n\
-  goto waitloop\r\n\
-)\r\n\
-if exist \"{uninstaller}\" (\r\n\
-  start \"\" /wait \"{uninstaller}\" /S\r\n\
-)\r\n\
-start \"\" /wait \"{installer}\" /S\r\n\
-if exist \"{appexe}\" (\r\n\
-  start \"\" \"{appexe}\"\r\n\
-)\r\n\
-del \"%~f0\"\r\n",
-        pid = pid,
-        uninstaller = uninstaller.to_string_lossy(),
-        installer = installer.to_string_lossy(),
-        appexe = current_exe.to_string_lossy(),
+    let log = helper_log_path();
+    let script = build_uninstall_script(
+        std::process::id(),
+        &uninstaller.to_string_lossy(),
+        &log.to_string_lossy(),
     );
-    std::fs::write(&script_path, script).map_err(|e| format!("写入更新脚本失败: {}", e))?;
-
-    // 用 cmd /C 启动，且完全脱离父进程（这样应用退出后它继续跑）
-    use std::os::windows::process::CommandExt;
-    const DETACHED_PROCESS: u32 = 0x0000_0008;
-    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    std::process::Command::new("cmd")
-        .args(["/C", &script_path.to_string_lossy()])
-        .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW)
-        .spawn()
-        .map_err(|e| format!("启动更新脚本失败: {}", e))?;
-
-    Ok(script_path)
+    spawn_hidden_vbs("deepahead-uninstall.vbs", &script)
 }
 
 #[cfg(test)]
@@ -346,5 +503,85 @@ mod tests {
         println!("received {} bytes", bytes.len());
         assert!(bytes.len() > 1024, "收到的内容过少");
         assert_eq!(&bytes[0..2], b"MZ", "安装包应以 MZ 开头");
+    }
+
+    /// 辅助脚本不得包含任何会弹控制台的构造。
+    /// 这条测试是为用户实测到的黑窗 bug（标题为 `find "292"`）加的回归防线。
+    #[test]
+    fn helper_scripts_never_allocate_a_console() {
+        let s = build_update_script(
+            1234,
+            r"C:\tmp\setup.exe",
+            r"C:\app\uninstall.exe",
+            r"C:\app\DeepAhead.exe",
+            r"C:\tmp\update.log",
+        );
+        // 这些都是上一版批处理里弹黑窗的元凶
+        for banned in ["cmd /C", "cmd.exe", "start \"\"", "tasklist", "timeout /t", "find \"", "@echo off"] {
+            assert!(
+                !s.contains(banned),
+                "辅助脚本不应再出现 `{}`（会弹控制台）",
+                banned
+            );
+        }
+        // 必须用 WMI 无控制台地等待进程退出
+        assert!(s.contains("Win32_Process"), "应当用 WMI 查询进程");
+        // 所有操作必须以窗口样式 0（隐藏）运行
+        assert!(s.contains(", 0, True"), "卸载/安装必须以隐藏窗口运行");
+        // 日志落文件（因为已经没有控制台可看）
+        assert!(s.contains("OpenTextFile"), "应当把过程写进日志文件");
+
+        let u = build_uninstall_script(1234, r"C:\app\uninstall.exe", r"C:\tmp\update.log");
+        assert!(u.contains(", 0, True"));
+        assert!(!u.contains("cmd.exe"));
+        assert!(!u.contains("tasklist"));
+    }
+
+    /// 真机验证辅助脚本：用同一份 header 跑 cscript，并通过**日志文件**确认执行成功。
+    ///
+    /// 注意：`cscript //B` 会把 `WScript.Echo` 的输出一并吞掉（实测即使最小 ANSI 脚本
+    /// 也拿不到 stdout），所以断言必须走日志文件 —— 这也正是生产脚本用的通道。
+    /// 用一个不存在的 PID，等待循环立即退出；正文只写日志，不触碰真实卸载/安装。
+    #[test]
+    fn vbscript_syntax_is_valid_on_this_machine() {
+        let dir = helper_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        let log = dir.join("syntax-probe.log");
+        let _ = std::fs::remove_file(&log);
+
+        // 与生产完全相同的 header（UTF-16LE 写入、WMI 等待、Sub/Function 定义）
+        let probe = format!(
+            "{}LogLine \"probe-ran\"\r\n",
+            vbs_header(999_999, &log.to_string_lossy())
+        );
+        let path = dir.join("syntax-probe.vbs");
+        let mut bytes: Vec<u8> = vec![0xFF, 0xFE];
+        for unit in probe.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        std::fs::write(&path, bytes).expect("写入探针脚本");
+
+        let out = std::process::Command::new("cscript.exe")
+            .args(["//B", "//Nologo", &path.to_string_lossy()])
+            .output()
+            .expect("无法运行 cscript.exe");
+        println!("cscript exit={:?}", out.status.code());
+        assert!(out.status.success(), "cscript 退出码非 0：{:?}", out.status.code());
+
+        let written = std::fs::read_to_string(&log).unwrap_or_default();
+        println!("probe log = {}", written.trim());
+        assert!(
+            written.contains("app exited after"),
+            "header 的等待循环未按预期执行，日志：{}",
+            written
+        );
+        assert!(
+            written.contains("probe-ran"),
+            "脚本正文未执行到 LogLine，日志：{}",
+            written
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&log);
     }
 }
