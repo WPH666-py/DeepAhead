@@ -302,6 +302,7 @@ pub async fn send_ai_message_with_tools(
         approval_gate: gate_arc,
         context_limit: effective_limit,
         auto_compress: effective_auto_compress,
+        memory: crate::ai::memory::get_config(),
     };
 
     // 事件转发到 Tauri：每个 agent 事件触发 ai-agent-event
@@ -514,6 +515,270 @@ pub async fn analyze_image(
 #[tauri::command]
 pub fn save_temp_image(data: String, ext: String) -> Result<String, String> {
     crate::ai::vision::save_temp_image(&data, &ext)
+}
+
+/// ════════════════════════════════════════════════════════
+/// 长期记忆协议（移植自 baaai123/dsh-memory-protocol）
+/// ════════════════════════════════════════════════════════
+
+/// 读取长期记忆配置
+#[tauri::command]
+pub fn get_memory_config() -> serde_json::Value {
+    serde_json::to_value(crate::ai::memory::get_config()).unwrap_or(serde_json::json!({}))
+}
+
+/// 更新长期记忆配置
+#[tauri::command]
+pub fn set_memory_config(
+    enabled: Option<bool>,
+    enforce_weave: Option<bool>,
+    inject_weave: Option<bool>,
+    auto_ingest: Option<bool>,
+    allowlist: Option<Vec<String>>,
+    fail_open: Option<bool>,
+) -> serde_json::Value {
+    let mut cfg = crate::ai::memory::get_config();
+    if let Some(v) = enabled { cfg.enabled = v; }
+    if let Some(v) = enforce_weave { cfg.enforce_weave = v; }
+    if let Some(v) = inject_weave { cfg.inject_weave = v; }
+    if let Some(v) = auto_ingest { cfg.auto_ingest = v; }
+    if let Some(v) = allowlist { cfg.allowlist = v; }
+    if let Some(v) = fail_open { cfg.fail_open = v; }
+    serde_json::to_value(crate::ai::memory::set_config(cfg)).unwrap_or(serde_json::json!({}))
+}
+
+/// 手动查阅记忆（weave）
+#[tauri::command]
+pub fn memory_weave(query: String, top_k: Option<usize>) -> Result<String, String> {
+    crate::ai::memory::weave(&query, "manual", top_k)
+}
+
+/// 写入一条记忆
+#[tauri::command]
+pub fn memory_ingest(
+    content: String,
+    role: Option<String>,
+    kind: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let rec = crate::ai::memory::ingest(
+        &content,
+        role.as_deref().unwrap_or("user"),
+        "manual",
+        kind.as_deref(),
+    )?;
+    serde_json::to_value(rec).map_err(|e| e.to_string())
+}
+
+/// 检索记忆
+#[tauri::command]
+pub fn memory_search(query: String, limit: Option<usize>) -> Result<serde_json::Value, String> {
+    let hits = crate::ai::memory::search(&query, limit)?;
+    let arr: Vec<serde_json::Value> = hits
+        .into_iter()
+        .map(|(r, s)| {
+            serde_json::json!({
+                "id": r.id, "kind": r.kind, "text": r.text,
+                "role": r.role, "created_at": r.created_at, "score": s,
+            })
+        })
+        .collect();
+    Ok(serde_json::json!({ "hits": arr }))
+}
+
+/// 记忆库状态
+#[tauri::command]
+pub fn memory_status() -> serde_json::Value {
+    crate::ai::memory::status()
+}
+
+/// 最近的记忆（界面展示）
+#[tauri::command]
+pub fn memory_recent(limit: Option<usize>) -> serde_json::Value {
+    serde_json::json!({ "records": crate::ai::memory::recent(limit) })
+}
+
+/// 清空全部记忆
+#[tauri::command]
+pub fn memory_clear() -> Result<usize, String> {
+    crate::ai::memory::clear()
+}
+
+/// ════════════════════════════════════════════════════════
+/// 插件体检（移植自 dsh-plugin-vet）
+/// ════════════════════════════════════════════════════════
+
+/// 静态扫描一个包目录/文件，返回两段式评分卡的第一段
+#[tauri::command]
+pub fn vet_scan(target: String) -> Result<serde_json::Value, String> {
+    let report = crate::ai::plugin_vet::scan_path(&target)?;
+    let name = std::path::Path::new(&target)
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| target.clone());
+    let scorecard = crate::ai::plugin_vet::render_scorecard(&report, &name);
+    Ok(serde_json::json!({
+        "report": report,
+        "scorecard": scorecard,
+    }))
+}
+
+/// 写健康档案（第二段：人工/模型审计结论）
+#[tauri::command]
+pub fn vet_write_health_record(
+    target: String,
+    name: Option<String>,
+    version: Option<String>,
+    risk: Option<String>,
+    recommendation: Option<String>,
+    notes: Option<String>,
+) -> Result<String, String> {
+    let report = crate::ai::plugin_vet::scan_path(&target)?;
+    let n = name.unwrap_or_else(|| {
+        std::path::Path::new(&target)
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| target.clone())
+    });
+    crate::ai::plugin_vet::write_health_record(
+        &n,
+        version.as_deref().unwrap_or("1.0.0"),
+        &report,
+        risk.as_deref().unwrap_or("clean"),
+        recommendation.as_deref().unwrap_or("review"),
+        notes.as_deref().unwrap_or(""),
+    )
+}
+
+/// 列出已有健康档案
+#[tauri::command]
+pub fn vet_list_records() -> serde_json::Value {
+    serde_json::json!({ "records": crate::ai::plugin_vet::list_health_records() })
+}
+
+/// ════════════════════════════════════════════════════════
+/// 规则引擎（移植自 dsh-rule-engine）
+/// ════════════════════════════════════════════════════════
+
+/// 从 $DSH_HOME/AGENTS.md 载入规则并给出概览
+#[tauri::command]
+pub fn rules_load() -> serde_json::Value {
+    let rules = crate::ai::rules_engine::load_rules_from_home();
+    let mut summary = crate::ai::rules_engine::rules_summary(&rules);
+    summary["rules_path"] = serde_json::json!(
+        crate::ai::rules_engine::dsh_home().join("AGENTS.md").to_string_lossy().to_string()
+    );
+    summary
+}
+
+/// 解析一段规则文本（不落盘，供界面预览）
+#[tauri::command]
+pub fn rules_parse(text: String) -> serde_json::Value {
+    let rules = crate::ai::rules_engine::parse_rules(&text);
+    crate::ai::rules_engine::rules_summary(&rules)
+}
+
+/// 读取审计账本
+#[tauri::command]
+pub fn rules_audit(limit: Option<usize>) -> serde_json::Value {
+    serde_json::json!({
+        "records": crate::ai::rules_engine::read_audit(limit.unwrap_or(50)),
+        "path": crate::ai::rules_engine::audit_path().to_string_lossy().to_string(),
+    })
+}
+
+/// 试算一次工具调用是否会被硬门拦下（界面自检用）
+#[tauri::command]
+pub fn rules_test_guard(
+    tool: String,
+    arguments: Option<serde_json::Value>,
+    user_text: Option<String>,
+) -> serde_json::Value {
+    let cfg = crate::ai::rules_engine::RuleEngineConfig::default();
+    let mut st = crate::ai::rules_engine::RuleEngineState::default();
+    let text = user_text.unwrap_or_default();
+    st.real_user_seen = !text.is_empty();
+    st.has_execute_clause = crate::ai::rules_engine::has_execute_clause(&text);
+    st.user_text = text;
+    let args = arguments.unwrap_or(serde_json::json!({}));
+    let now = chrono::Utc::now().timestamp();
+    let d = crate::ai::rules_engine::guard_decision(&cfg, &mut st, &tool, &args, now);
+    serde_json::to_value(d).unwrap_or(serde_json::json!({}))
+}
+
+/// ════════════════════════════════════════════════════════
+/// 费用统计（移植自 dsh-cost-meter）
+/// ════════════════════════════════════════════════════════
+
+#[tauri::command]
+pub fn cost_snapshot() -> serde_json::Value {
+    crate::ai::cost_meter::snapshot()
+}
+
+/// 更新费用配置（币种/展示/预算/保留期）
+#[tauri::command]
+pub fn cost_set_config(
+    currency: Option<String>,
+    symbol: Option<String>,
+    decimals: Option<u32>,
+    exchange_rate: Option<f64>,
+    history_days: Option<u32>,
+    budget_enabled: Option<bool>,
+    budget_amount: Option<f64>,
+    budget_period: Option<String>,
+) -> serde_json::Value {
+    let cfg = crate::ai::cost_meter::update_config(|c| {
+        if let Some(v) = &currency {
+            c.currency = if v.eq_ignore_ascii_case("cny") {
+                crate::ai::cost_meter::Currency::Cny
+            } else {
+                crate::ai::cost_meter::Currency::Usd
+            };
+        }
+        if let Some(v) = symbol { c.symbol = v; }
+        if let Some(v) = decimals { c.decimals = v; }
+        if let Some(v) = exchange_rate { if v > 0.0 { c.exchange_rate = v; } }
+        if let Some(v) = history_days { c.history_days = v.clamp(7, 3650); }
+        if let Some(v) = budget_enabled { c.budget_enabled = v; }
+        if let Some(v) = budget_amount { c.budget_amount = v; }
+        if let Some(v) = budget_period { c.budget_period = v; }
+    });
+    serde_json::to_value(cfg).unwrap_or(serde_json::json!({}))
+}
+
+/// 清空费用历史
+#[tauri::command]
+pub fn cost_clear() -> serde_json::Value {
+    serde_json::json!({ "cleared_days": crate::ai::cost_meter::clear_history() })
+}
+
+/// ════════════════════════════════════════════════════════
+/// 上下文压缩（billion-context）：窗口与判定自检
+/// ════════════════════════════════════════════════════════
+
+/// 返回当前压缩引擎的阈值与默认配置（供界面展示与调参）
+#[tauri::command]
+pub fn context_engine_config(context_limit: Option<usize>) -> serde_json::Value {
+    let cfg = crate::ai::billion_context::BillionConfig::with_limit(
+        context_limit.unwrap_or(crate::ai::context::DEFAULT_CONTEXT_LIMIT),
+    );
+    serde_json::json!({
+        "model_context_limit": cfg.model_context_limit,
+        "max_context_limit_pct": cfg.max_context_limit_pct,
+        "min_context_limit_pct": cfg.min_context_limit_pct,
+        "emergency_threshold_pct": cfg.emergency_threshold_pct,
+        "nudge_growth_tokens": cfg.nudge_growth_tokens(),
+        "growth_floor": cfg.growth_floor_effective(),
+        "min_pressure_benefit": cfg.min_pressure_benefit(),
+        "tier_threshold_1": cfg.tier_threshold(1),
+        "tier_threshold_2": cfg.tier_threshold(2),
+        "tiers_enabled": cfg.tiers_enabled,
+        "min_compress_range": cfg.min_compress_range,
+        "min_summary_length": cfg.min_summary_length,
+        "max_summary_length": cfg.max_summary_length,
+        "preserve_recent_messages": cfg.preserve_recent_messages,
+        "preserve_recent_tokens": cfg.preserve_recent_tokens,
+        "engine": "billion-context (acp-kernel port)",
+    })
 }
 
 /// ════════════════════════════════════════════════════════

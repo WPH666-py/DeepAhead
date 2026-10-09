@@ -218,6 +218,8 @@ pub fn clone_for_phase(input: &AgentLoopInput) -> AgentLoopInput {
         // 阶段沿用主运行的上下文窗口与压缩模式
         context_limit: input.context_limit,
         auto_compress: input.auto_compress,
+        // 长期记忆配置沿用主运行
+        memory: input.memory.clone(),
     }
 }
 

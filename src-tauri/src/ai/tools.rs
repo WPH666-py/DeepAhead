@@ -137,6 +137,11 @@ impl ToolRegistry {
             Self::read_excel_schema(),
             Self::check_runtime_schema(),
             Self::read_image_schema(),
+            // 长期记忆协议（dsh-memory-protocol 移植）
+            Self::memory_weave_schema(),
+            Self::memory_ingest_schema(),
+            Self::memory_search_schema(),
+            Self::memory_status_schema(),
         ]
     }
 
@@ -169,6 +174,11 @@ impl ToolRegistry {
             "read_excel" => self.tool_read_excel(&call.function.arguments),
             "check_runtime" => self.tool_check_runtime(&call.function.arguments),
             "read_image" => self.tool_read_image(&call.function.arguments).await,
+            // ─── 长期记忆协议 ───
+            "memory_weave" => self.tool_memory_weave(&call.function.arguments),
+            "memory_ingest" => self.tool_memory_ingest(&call.function.arguments),
+            "memory_search" => self.tool_memory_search(&call.function.arguments),
+            "memory_status" => self.tool_memory_status(&call.function.arguments),
             other => ToolResult {
                 success: false,
                 output: format!("Unknown tool: {}", other),
@@ -877,6 +887,140 @@ impl ToolRegistry {
                     },
                     "required": ["items"]
                 }),
+            },
+        }
+    }
+
+    // ════════════════════════════════════════════════════════
+    // 长期记忆协议（移植自 dsh-memory-protocol）
+    // ════════════════════════════════════════════════════════
+
+    fn tool_memory_weave(&self, args: &Value) -> ToolResult {
+        let query = args.get("user_message").and_then(|v| v.as_str()).unwrap_or("");
+        match crate::ai::memory::weave(query, "", None) {
+            Ok(ctx) => {
+                if ctx.trim().is_empty() {
+                    ToolResult {
+                        success: true,
+                        output: "记忆库为空（本轮无相关记忆）。已满足记忆协议，可继续执行。".into(),
+                        data: Some(json!({"context": "", "empty": true})),
+                    }
+                } else {
+                    ToolResult {
+                        success: true,
+                        output: format!("已查阅长期记忆，相关记忆如下：\n{}", ctx),
+                        data: Some(json!({"context": ctx, "empty": false})),
+                    }
+                }
+            }
+            Err(e) => ToolResult { success: false, output: format!("查阅记忆失败: {}", e), data: None },
+        }
+    }
+
+    fn tool_memory_ingest(&self, args: &Value) -> ToolResult {
+        let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        let role = args.get("role").and_then(|v| v.as_str()).unwrap_or("user");
+        let kind = args.get("kind").and_then(|v| v.as_str());
+        match crate::ai::memory::ingest(content, role, "", kind) {
+            Ok(rec) => ToolResult {
+                success: true,
+                output: format!("已写入长期记忆（{}，{} 字符）", rec.kind, rec.text.chars().count()),
+                data: Some(json!({"id": rec.id, "kind": rec.kind})),
+            },
+            Err(e) => ToolResult { success: false, output: e, data: None },
+        }
+    }
+
+    fn tool_memory_search(&self, args: &Value) -> ToolResult {
+        let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
+        let limit = args.get("limit").and_then(|v| v.as_u64()).map(|n| n as usize);
+        match crate::ai::memory::search(query, limit) {
+            Ok(hits) => {
+                if hits.is_empty() {
+                    return ToolResult { success: true, output: "未检索到相关记忆。".into(), data: Some(json!({"hits": []})) };
+                }
+                let mut out = String::new();
+                let mut arr = Vec::new();
+                for (r, score) in &hits {
+                    out.push_str(&format!("- ({:.2}) [{}] {}\n", score, r.kind, r.text));
+                    arr.push(json!({"id": r.id, "kind": r.kind, "text": r.text, "score": score}));
+                }
+                ToolResult { success: true, output: out, data: Some(json!({"hits": arr})) }
+            }
+            Err(e) => ToolResult { success: false, output: format!("检索记忆失败: {}", e), data: None },
+        }
+    }
+
+    fn tool_memory_status(&self, _args: &Value) -> ToolResult {
+        let st = crate::ai::memory::status();
+        ToolResult {
+            success: true,
+            output: format!("长期记忆：{} 条记录\n存储：{}", st["records"], st["file"].as_str().unwrap_or("")),
+            data: Some(st),
+        }
+    }
+
+    fn memory_weave_schema() -> ToolSchema {
+        ToolSchema {
+            kind: "function",
+            function: ToolFunctionSchema {
+                name: "memory_weave",
+                description: "查阅长期记忆（每轮动手前的第一步）。传入本轮用户诉求，返回相关记忆与既有约束。",
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "user_message": { "type": "string", "description": "本轮用户的诉求/问题（用于检索相关记忆）" }
+                    },
+                    "required": ["user_message"]
+                }),
+            },
+        }
+    }
+
+    fn memory_ingest_schema() -> ToolSchema {
+        ToolSchema {
+            kind: "function",
+            function: ToolFunctionSchema {
+                name: "memory_ingest",
+                description: "把值得长期记住的事实/偏好/结论写入长期记忆，供后续轮次检索。",
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "content": { "type": "string", "description": "要记住的内容（会被截断到 4000 字符）" },
+                        "role": { "type": "string", "enum": ["user", "assistant"], "description": "内容来源角色" },
+                        "kind": { "type": "string", "enum": ["turn", "note", "skill", "conclusion"], "description": "记忆类型" }
+                    },
+                    "required": ["content"]
+                }),
+            },
+        }
+    }
+
+    fn memory_search_schema() -> ToolSchema {
+        ToolSchema {
+            kind: "function",
+            function: ToolFunctionSchema {
+                name: "memory_search",
+                description: "在长期记忆中做关键词检索（BM25 + 字符二元组，中英文均可）。",
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string" },
+                        "limit": { "type": "integer", "description": "返回条数上限（默认 20）" }
+                    },
+                    "required": ["query"]
+                }),
+            },
+        }
+    }
+
+    fn memory_status_schema() -> ToolSchema {
+        ToolSchema {
+            kind: "function",
+            function: ToolFunctionSchema {
+                name: "memory_status",
+                description: "查看长期记忆库的规模与存储位置。",
+                parameters: json!({ "type": "object", "properties": {} }),
             },
         }
     }

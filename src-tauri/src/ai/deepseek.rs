@@ -88,6 +88,15 @@ pub struct Usage {
     pub completion_tokens: u32,
     #[serde(default)]
     pub total_tokens: u32,
+    /// 命中的前缀缓存 token 数（DeepSeek 兼容字段）——用于按 cacheHit 计价
+    #[serde(default, alias = "prompt_cache_hit_tokens")]
+    pub cache_hit_tokens: u32,
+    /// 未命中缓存的 prompt token 数——用于按 cacheMiss 计价
+    #[serde(default, alias = "prompt_cache_miss_tokens")]
+    pub cache_miss_tokens: u32,
+    /// 推理（thinking）token 数
+    #[serde(default)]
+    pub reasoning_tokens: u32,
 }
 
 /// SSE 流式响应的 Delta 结构

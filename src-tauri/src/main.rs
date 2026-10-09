@@ -46,6 +46,30 @@ fn main() {
             commands::estimate_context_usage,
             commands::compress_context,
             commands::get_context_config,
+            // 上下文压缩引擎（billion-context 移植）
+            commands::context_engine_config,
+            // 长期记忆协议（dsh-memory-protocol 移植）
+            commands::get_memory_config,
+            commands::set_memory_config,
+            commands::memory_weave,
+            commands::memory_ingest,
+            commands::memory_search,
+            commands::memory_status,
+            commands::memory_recent,
+            commands::memory_clear,
+            // 插件体检（dsh-plugin-vet 移植）
+            commands::vet_scan,
+            commands::vet_write_health_record,
+            commands::vet_list_records,
+            // 规则引擎（dsh-rule-engine 移植）
+            commands::rules_load,
+            commands::rules_parse,
+            commands::rules_audit,
+            commands::rules_test_guard,
+            // 费用统计（dsh-cost-meter 移植）
+            commands::cost_snapshot,
+            commands::cost_set_config,
+            commands::cost_clear,
             // 执行许可（需分步确认 / 全流程开放）
             commands::respond_tool_approval,
             // Agent + 安全
@@ -59,6 +83,8 @@ fn main() {
             commands::git_branches,
             commands::git_clone,
             commands::git_push,
+            commands::git_log_graph,
+            commands::git_commit_detail,
             // SSH
             commands::ssh_test_connection,
             commands::ssh_exec,

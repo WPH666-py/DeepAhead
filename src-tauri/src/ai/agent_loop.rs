@@ -154,6 +154,8 @@ pub struct AgentLoopInput {
     pub context_limit: usize,
     /// 上下文压缩模式：true = 自动（≥85% 自动压缩用户上下文，不清空对话）；false = 手动（仅提示）
     pub auto_compress: bool,
+    /// 长期记忆协议配置（移植自 dsh-memory-protocol）
+    pub memory: crate::ai::memory::MemoryConfig,
 }
 
 pub struct AgentLoopOutput {
@@ -220,6 +222,34 @@ where
         if !extra.is_empty() {
             system_prompt.push_str("\n\n");
             system_prompt.push_str(extra);
+        }
+    }
+
+    // ─── 长期记忆协议：轮首 weave（对齐上游 agent/pre-step）───
+    // 每轮先查阅长期记忆，把检索结果注入系统提示；
+    // 「成功但为空」同样视为已 weave（满足门），「失败」不满足门。
+    let mut memory_weaved_this_turn = false;
+    let mut memory_available = true;
+    if input.memory.enabled && input.memory.inject_weave {
+        match crate::ai::memory::weave(&input.user_message, &input.run_id, None) {
+            Ok(ctx) => {
+                memory_weaved_this_turn = true;
+                if !ctx.trim().is_empty() {
+                    system_prompt.push_str("\n\n## 长期记忆（本轮已自动查阅）\n");
+                    system_prompt.push_str(crate::ai::memory::MEMORY_INTRO);
+                    system_prompt.push('\n');
+                    system_prompt.push_str(&ctx);
+                }
+            }
+            Err(e) => {
+                // 失败开放：记忆后端不可用时不阻塞主流程，只降级
+                memory_available = false;
+                let note = format!(
+                    "\n\n## 长期记忆\n（记忆后端不可用，本轮已按「失败开放」降级继续：{}）",
+                    e
+                );
+                system_prompt.push_str(&note);
+            }
         }
     }
 
@@ -291,6 +321,18 @@ where
     let mut final_content = String::new();
     let mut total_tool_calls = 0;
     let mut last_reasoning: Option<String> = None;
+    // ─── 费用统计累计 + 规则引擎运行时状态 ───
+    let mut cost_input: usize = 0;
+    let mut cost_output: usize = 0;
+    let mut cost_cache_hit: usize = 0;
+    let mut cost_cache_miss: usize = 0;
+    let mut cost_reasoning: usize = 0;
+    let mut rule_state = crate::ai::rules_engine::RuleEngineState::default();
+    rule_state.real_user_seen = true;
+    rule_state.user_text = input.user_message.clone();
+    rule_state.has_execute_clause = crate::ai::rules_engine::has_execute_clause(&input.user_message);
+    let rule_cfg = crate::ai::rules_engine::RuleEngineConfig::default();
+    let guard_enabled = rule_cfg.enabled;
 
     // 3. 主循环（max_iterations = 0 表示不限步数：直到模型给出结论或出错才结束）
     let mut iter: usize = 0;
@@ -416,6 +458,22 @@ where
         final_content = assistant_msg.content.clone();
         last_reasoning = assistant_msg.reasoning_content.clone();
 
+        // ─── 费用统计：累计本次迭代的 token 用量 ───
+        {
+            let u = &response.usage;
+            let hit = u.cache_hit_tokens as usize;
+            let miss = if u.cache_miss_tokens > 0 {
+                u.cache_miss_tokens as usize
+            } else {
+                (u.prompt_tokens as usize).saturating_sub(hit)
+            };
+            cost_cache_hit += hit;
+            cost_cache_miss += miss;
+            cost_output += u.completion_tokens as usize;
+            cost_reasoning += u.reasoning_tokens as usize;
+            cost_input += u.prompt_tokens as usize;
+        }
+
         // DSML 双源检测：DeepSeek 推理模型会把工具调用写成 content 或 reasoning_content 里的 DSML 文本
         let dsml_source = format!(
             "{}{}",
@@ -458,6 +516,12 @@ where
             });
             events.push(ev.clone());
             on_event(ev);
+            memory_auto_ingest(&input.memory, &input.run_id, &input.user_message, &final_content);
+            // ─── 费用记账（dsh-cost-meter 移植）───
+            cost_record(
+                &input.mode, &input.run_id,
+                cost_input, cost_output, cost_cache_hit, cost_cache_miss, cost_reasoning,
+            );
             return Ok(AgentLoopOutput {
                 final_content,
                 total_iterations: iter + 1,
@@ -486,6 +550,81 @@ where
             });
             events.push(ev.clone());
             on_event(ev);
+
+            // ─── 长期记忆硬门（对齐上游 tools/pre-execute）───
+            // 未 weave 就调用非记忆工具 → 拒绝。记忆工具自身永远放行（否则死锁）。
+            {
+                let name = call_with_parsed_args.function.name.as_str();
+                if name == "memory_weave" {
+                    memory_weaved_this_turn = true;
+                }
+                let exempt = crate::ai::memory::is_memory_tool(name)
+                    || input.memory.allowlist.iter().any(|a| a == name);
+                let should_gate = input.memory.enabled
+                    && input.memory.enforce_weave
+                    && !exempt
+                    && !memory_weaved_this_turn;
+                // 失败开放：后端不可用时放行（避免把应用锁死）
+                let deny = if should_gate && !memory_available && input.memory.fail_open {
+                    false
+                } else {
+                    should_gate
+                };
+                if deny {
+                    let reason = crate::ai::memory::MEMORY_DENY_REASON.to_string();
+                    messages.push(tool_result_message(
+                        &call_with_parsed_args.id,
+                        name,
+                        &ToolResult { success: false, output: reason.clone(), data: None },
+                    ));
+                    let ev = AgentEvent::new(AgentEventKind::ToolCallExecuted {
+                        id: call_with_parsed_args.id.clone(),
+                        name: name.to_string(),
+                        success: false,
+                        output: reason,
+                    });
+                    events.push(ev.clone());
+                    on_event(ev);
+                    continue;
+                }
+            }
+
+            // ─── 规则引擎硬门（移植自 dsh-rule-engine）───
+            // 与上游一致：拒绝发生在工具执行之前，理由写明补救动作，并记入审计账本。
+            if guard_enabled {
+                let now = chrono::Utc::now().timestamp();
+                let decision = crate::ai::rules_engine::guard_decision(
+                    &rule_cfg,
+                    &mut rule_state,
+                    &call_with_parsed_args.function.name,
+                    &call_with_parsed_args.function.arguments,
+                    now,
+                );
+                crate::ai::rules_engine::audit(
+                    if decision.allow { "allow" } else { "deny" },
+                    &decision.rule_id,
+                    &call_with_parsed_args.function.name,
+                    &decision.reason,
+                    &decision.err_id,
+                );
+                if !decision.allow {
+                    let reason = decision.reason.clone();
+                    messages.push(tool_result_message(
+                        &call_with_parsed_args.id,
+                        &call_with_parsed_args.function.name,
+                        &ToolResult { success: false, output: reason.clone(), data: None },
+                    ));
+                    let ev = AgentEvent::new(AgentEventKind::ToolCallExecuted {
+                        id: call_with_parsed_args.id.clone(),
+                        name: call_with_parsed_args.function.name.clone(),
+                        success: false,
+                        output: reason,
+                    });
+                    events.push(ev.clone());
+                    on_event(ev);
+                    continue;
+                }
+            }
 
             // Claude 模式：Edit/Write 前必须 Read
             if config.inject_read_before_edit_reminder {
@@ -614,6 +753,11 @@ where
     events.push(ev.clone());
     on_event(ev);
 
+    memory_auto_ingest(&input.memory, &input.run_id, &input.user_message, &final_content);
+    cost_record(
+        &input.mode, &input.run_id,
+        cost_input, cost_output, cost_cache_hit, cost_cache_miss, cost_reasoning,
+    );
     Ok(AgentLoopOutput {
         final_content,
         total_iterations: config.max_iterations,
@@ -630,6 +774,65 @@ where
 // ════════════════════════════════════════════════════════
 // 辅助函数
 // ════════════════════════════════════════════════════════
+
+/// 费用记账（移植自 dsh-cost-meter）：一次 Agent 运行累计的 token 用量记一笔。
+/// 记账失败必须被吞掉——计量不能拖垮主流程。
+#[allow(clippy::too_many_arguments)]
+fn cost_record(
+    mode: &str,
+    session_id: &str,
+    input_tokens: usize,
+    output_tokens: usize,
+    cache_hit: usize,
+    cache_miss: usize,
+    reasoning: usize,
+) {
+    if input_tokens == 0 && output_tokens == 0 && cache_hit == 0 && cache_miss == 0 {
+        return;
+    }
+    let model = crate::ai::cost_meter::canonical_model("deepseek-v4-flash");
+    let _ = mode;
+    // 净输入 = 未命中缓存部分（命中部分单独按 cacheHit 计价，二者互斥）
+    let usage = crate::ai::cost_meter::CallUsage {
+        model,
+        provider: "deepseek".into(),
+        session_id: session_id.to_string(),
+        session_title: format!("{} 模式会话", mode.to_uppercase()),
+        input: cache_miss,
+        output: output_tokens,
+        cache_read: cache_hit,
+        cache_write: 0,
+        reasoning,
+        is_plan: false,
+        at: chrono::Utc::now().timestamp(),
+    };
+    let _ = crate::ai::cost_meter::record_call(&usage);
+}
+
+/// 轮末自动归档（对齐上游 agent/turn-stopping）：
+/// 把本轮用户诉求与最终回复合并写入长期记忆，失败不影响主流程。
+fn memory_auto_ingest(
+    cfg: &crate::ai::memory::MemoryConfig,
+    session_id: &str,
+    user_message: &str,
+    final_content: &str,
+) {
+    if !cfg.enabled || !cfg.auto_ingest {
+        return;
+    }
+    let u = user_message.trim();
+    let a = final_content.trim();
+    if u.is_empty() && a.is_empty() {
+        return;
+    }
+    let text = if a.is_empty() {
+        u.to_string()
+    } else {
+        format!("用户诉求：{}\n\n本轮结论：{}", u, a)
+    };
+    // 失败必须被吞掉：归档失败不能阻塞轮次收尾
+    let _ = crate::ai::memory::ingest(&text, "user", session_id, Some("turn"));
+}
 
 /// 通用消息 → 可压缩消息（带 Token 估算）
 fn messages_to_compressed(ms: &[Message]) -> Vec<CompressedMessage> {
@@ -929,6 +1132,7 @@ fn make_subagent_executor(input: &AgentLoopInput) -> SubagentExecutor {
     let approval_gate = input.approval_gate.clone();
     let context_limit = input.context_limit;
     let auto_compress = input.auto_compress;
+    let memory_cfg = input.memory.clone();
     Arc::new(move |instruction: String| -> futures_util::future::BoxFuture<'static, Result<String, String>> {
         let deepseek = deepseek.clone();
         let system_prompt = system_prompt.clone();
@@ -937,6 +1141,7 @@ fn make_subagent_executor(input: &AgentLoopInput) -> SubagentExecutor {
         let undo_store = undo_store.clone();
         let run_id = run_id.clone();
         let approval_gate = approval_gate.clone();
+        let memory_cfg = memory_cfg.clone();
         Box::pin(async move {
             let sub_input = AgentLoopInput {
                 mode,
@@ -958,6 +1163,8 @@ fn make_subagent_executor(input: &AgentLoopInput) -> SubagentExecutor {
                 // 子智能体沿用主循环的上下文窗口与压缩模式
                 context_limit,
                 auto_compress,
+                // 子智能体共享同一套长期记忆配置
+                memory: memory_cfg.clone(),
             };
             let output = run_agent_loop(sub_input, |_| {}).await;
             match output {

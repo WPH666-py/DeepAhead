@@ -22,7 +22,20 @@
       </div>
       <button class="menu-button" @click="showSettings = true">设置</button>
       <button class="menu-button" @click="openLocalTerminal">本地终端</button>
-      <button class="menu-button" @click="showGitPushModal = true">Git提交</button>
+      <!-- Git 面板：Git 提交 + 历史提交记录（集成 git-graph） -->
+      <div style="position:relative">
+        <button
+          class="menu-button"
+          :class="{ active: openDropdown === 'gitMenu' }"
+          @click="toggleDropdown('gitMenu')"
+        >
+          🔀 Git 面板 &#9662;
+        </button>
+        <div class="dropdown-menu" :class="{ show: openDropdown === 'gitMenu' }">
+          <div class="dropdown-item" @click="openGitCommitPanel">⬆ Git 提交</div>
+          <div class="dropdown-item" @click="openGitHistoryPanel">🌳 历史提交记录</div>
+        </div>
+      </div>
       <div style="display:flex;align-items:center;gap:0.2rem">
         <select class="runtime-select" v-model="selectedRuntime" @change="onEnvRuntimeChange">
           <option value="">全部环境</option>
@@ -79,6 +92,8 @@
         </div>
         <!-- AI 配置：打开配置弹窗 -->
         <button class="menu-button" title="打开 AI 配置（模型/视觉识别）" @click="openAIConfig">AI配置</button>
+        <!-- 集成能力：费用 / 上下文 / 记忆 / 规则 / 体检 -->
+        <button class="menu-button" title="费用统计 · 上下文压缩 · 长期记忆 · 规则引擎 · 插件体检" @click="openCapabilities">🧩 集成能力</button>
       </div>
     </div>
 
@@ -431,11 +446,11 @@
       </div>
     </div>
 
-    <!-- Git 推送弹框 -->
+    <!-- Git 面板 · Git 提交弹框 -->
     <div class="modal-overlay" :class="{ show: showGitPushModal }" @click.self="showGitPushModal = false">
       <div class="modal-box">
         <div class="modal-header">
-          <h3>🔀 Git 推送</h3>
+          <h3>⬆ Git 提交</h3>
           <button class="modal-close" @click="showGitPushModal = false">&times;</button>
         </div>
         <div class="modal-body">
@@ -455,7 +470,89 @@
         </div>
         <div class="modal-body" style="padding-top:0;display:flex;gap:0.5rem;justify-content:flex-end">
           <button class="btn btn-secondary" style="font-size:0.82rem;padding:0.4rem 1rem" @click="loadGitStatus">📋 检查状态</button>
-          <button class="btn btn-primary" style="font-size:0.82rem;padding:0.4rem 1rem" @click="gitPush">⬆ 推送</button>
+          <button class="btn btn-primary" style="font-size:0.82rem;padding:0.4rem 1rem" @click="gitPush">⬆ 提交并推送</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Git 面板 · 历史提交记录（集成 git-graph 泳道图 + 提交详情） -->
+    <div class="modal-overlay git-history-modal" :class="{ show: showGitHistoryModal }" @click.self="showGitHistoryModal = false">
+      <div class="modal-box">
+        <div class="modal-header">
+          <h3>🌳 历史提交记录</h3>
+          <button class="modal-close" @click="showGitHistoryModal = false">&times;</button>
+        </div>
+        <div class="git-history-toolbar">
+          <input type="text" v-model="gitHistoryPath" placeholder="仓库路径" @keyup.enter="loadGitGraph">
+          <button class="btn btn-secondary" style="font-size:0.78rem;padding:0.3rem 0.7rem;white-space:nowrap" @click="selectGitLocalPath">选择</button>
+          <select v-model.number="gitGraphCount" @change="loadGitGraph" style="padding:0.3rem 0.4rem;border:1px solid #ddd;border-radius:4px;font-size:0.78rem">
+            <option :value="50">最近 50 条</option>
+            <option :value="200">最近 200 条</option>
+            <option :value="500">最近 500 条</option>
+            <option :value="1000">最近 1000 条</option>
+          </select>
+          <button class="btn btn-primary" style="font-size:0.78rem;padding:0.3rem 0.7rem;white-space:nowrap" @click="loadGitGraph">刷新</button>
+        </div>
+        <div class="git-history-body">
+          <div v-if="gitGraphLoading" class="git-history-hint">正在读取提交历史…</div>
+          <div v-else-if="gitGraphError" class="git-history-hint error">读取失败：{{ gitGraphError }}</div>
+          <div v-else-if="gitGraphRows.length === 0" class="git-history-hint">该仓库暂无提交记录</div>
+          <template v-else>
+            <div class="git-graph-list">
+              <div
+                v-for="(row, ri) in gitGraphRows"
+                :key="gitGraphCommits[ri].oid"
+                class="git-graph-row"
+                :class="{ selected: gitGraphSelected === gitGraphCommits[ri].oid }"
+                :title="gitGraphCommits[ri].oid"
+              >
+                <!-- 泳道字形（对齐 dsh-git-graph：● 提交 / ◆ 合并 / │ 贯穿 / 空格） -->
+                <span class="git-graph-lanes" :data-gitgraph-lanes="row.nodeColumn">
+                  <span
+                    v-for="(g, gi) in row.columns"
+                    :key="gi"
+                    class="git-lane"
+                    :class="'git-lane-' + g"
+                    :data-gitgraph-glyph="g"
+                  >{{ laneGlyphChar(g) }}</span>
+                </span>
+                <!-- 提交信息 -->
+                <div class="git-graph-info" @click="selectGitCommit(gitGraphCommits[ri])">
+                  <div class="git-graph-subject">
+                    <span
+                      v-for="ref in gitGraphCommits[ri].refs"
+                      :key="ref"
+                      class="git-ref"
+                      :class="{ 'git-ref-current': isCurrentRef(ref) }"
+                    >{{ ref }}</span>
+                    <span class="git-graph-subject-text" :title="gitGraphCommits[ri].subject">{{ gitGraphCommits[ri].subject || '(无提交信息)' }}</span>
+                  </div>
+                  <div class="git-graph-meta">
+                    <code>{{ gitGraphCommits[ri].short }}</code>
+                    <span>{{ gitGraphCommits[ri].author }}</span>
+                    <span>·</span>
+                    <span>{{ relativeTime(gitGraphCommits[ri].author_time) }}</span>
+                    <span v-if="row.merge" class="git-graph-merge">merge</span>
+                  </div>
+                </div>
+              </div>
+              <div v-if="gitGraphHasMore" class="git-graph-more">
+                <button class="btn btn-secondary" style="font-size:0.78rem;padding:0.35rem 1rem" @click="loadMoreGitGraph">加载更多</button>
+              </div>
+            </div>
+            <!-- 提交详情 -->
+            <div v-if="gitGraphSelected" class="git-commit-detail">
+              <div v-if="!gitGraphDetail" class="git-history-hint">正在读取改动…</div>
+              <template v-else>
+                <div class="git-commit-detail-files">
+                  <b>{{ gitGraphDetail.files.length }}</b> 个文件变更
+                  <span v-for="f in gitGraphDetail.files.slice(0, 12)" :key="f" class="git-file-chip">{{ f }}</span>
+                  <span v-if="gitGraphDetail.files.length > 12" class="git-file-chip">…</span>
+                </div>
+                <pre class="git-commit-patch">{{ gitGraphDetail.patch || '(无 diff 内容)' }}</pre>
+              </template>
+            </div>
+          </template>
         </div>
       </div>
     </div>
@@ -606,7 +703,23 @@
           </div>
           <div class="config-field"><label>API Key</label><input type="password" v-model="apiKeyInput" placeholder="sk-..."></div>
           <div class="config-field"><label>Base URL</label><input v-model="baseUrlInput" placeholder="https://api.deepseek.com"></div>
-          <div class="config-field"><label>Model</label><input v-model="modelInput" placeholder="deepseek-chat"></div>
+          <!-- 主模型只支持 DeepSeek 模型 -->
+          <div class="config-field">
+            <label>Model（主模型只支持 DeepSeek）</label>
+            <select :value="modelPreset" @change="onModelPresetChange" style="width:100%;padding:0.45rem 0.5rem;border:1px solid #ccc;border-radius:5px">
+              <option v-for="m in DEEPSEEK_MODELS" :key="m.id" :value="m.id">{{ m.label }}</option>
+              <option value="__custom__">自定义 DeepSeek 模型……</option>
+            </select>
+          </div>
+          <div class="config-field" v-if="modelPreset === '__custom__'">
+            <label>自定义模型名（必须为 DeepSeek 模型）</label>
+            <input v-model="modelInput" placeholder="如 deepseek-v4 / deepseek-ai/DeepSeek-V4">
+          </div>
+          <div class="config-field" v-else>
+            <div class="config-model-locked">
+              ✅ 主模型已锁定为 <b>{{ modelInput }}</b> —— 运行时只走 DeepSeek Token。
+            </div>
+          </div>
 
           <!-- ─── 上下文占用比例 + 压缩上下文 ─── -->
           <div style="border-top:1px solid #eee;margin:0.9rem 0 0.6rem"></div>
@@ -670,6 +783,157 @@
         </div>
       </div>
     </div>
+
+    <!-- 集成能力面板：dsh-cost-meter / billion-context / dsh-memory-protocol / dsh-rule-engine / dsh-plugin-vet -->
+    <div class="modal-overlay cap-modal" :class="{ show: showCapModal }" @click.self="showCapModal = false">
+      <div class="modal-box">
+        <div class="modal-header">
+          <h3>🧩 集成能力</h3>
+          <button class="modal-close" @click="showCapModal = false">&times;</button>
+        </div>
+        <div class="cap-tabs">
+          <div class="cap-tab" :class="{ active: capTab === 'cost' }" @click="capTab = 'cost'">费用统计</div>
+          <div class="cap-tab" :class="{ active: capTab === 'context' }" @click="capTab = 'context'">上下文压缩</div>
+          <div class="cap-tab" :class="{ active: capTab === 'memory' }" @click="capTab = 'memory'">长期记忆</div>
+          <div class="cap-tab" :class="{ active: capTab === 'rules' }" @click="capTab = 'rules'">规则引擎</div>
+          <div class="cap-tab" :class="{ active: capTab === 'vet' }" @click="capTab = 'vet'">插件体检</div>
+        </div>
+        <div class="cap-body">
+          <!-- 费用统计 -->
+          <template v-if="capTab === 'cost'">
+            <div v-if="!costSnapshot" class="cap-hint">未读取到费用数据。</div>
+            <template v-else>
+              <div class="cap-metrics">
+                <div class="cap-metric"><span class="cap-metric-label">今日</span><b>{{ costSnapshot.today.display }}</b><span class="cap-metric-sub">{{ costSnapshot.today.calls }} 次 · {{ (costSnapshot.today.tokens / 1000).toFixed(1) }}k tok</span></div>
+                <div class="cap-metric"><span class="cap-metric-label">本月</span><b>{{ costSnapshot.month.display }}</b><span class="cap-metric-sub">{{ costSnapshot.month.calls }} 次 · {{ (costSnapshot.month.tokens / 1000).toFixed(1) }}k tok</span></div>
+                <div class="cap-metric"><span class="cap-metric-label">累计</span><b>{{ costSnapshot.all.display }}</b><span class="cap-metric-sub">{{ costSnapshot.all.calls }} 次 · {{ (costSnapshot.all.tokens / 1000).toFixed(1) }}k tok</span></div>
+                <div class="cap-metric"><span class="cap-metric-label">缓存命中率</span><b>{{ (costSnapshot.cache_hit_rate * 100).toFixed(1) }}%</b><span class="cap-metric-sub">{{ costSnapshot.day_count }} 天账本</span></div>
+              </div>
+              <div class="cap-row">
+                <span>币种</span>
+                <span class="cap-val">{{ costSnapshot.currency }}（{{ costSnapshot.symbol }}，汇率 {{ costSnapshot.exchange_rate }}）</span>
+              </div>
+              <div v-if="costSnapshot.by_model?.length" class="cap-table">
+                <div class="cap-th"><span>模型</span><span>成本</span><span>调用</span><span>Tokens</span></div>
+                <div v-for="m in costSnapshot.by_model" :key="m.model" class="cap-tr">
+                  <span class="cap-mono">{{ m.model }}</span>
+                  <span>{{ costSnapshot.symbol }}{{ m.cost.toFixed(4) }}</span>
+                  <span>{{ m.calls }}</span>
+                  <span>{{ (m.tokens / 1000).toFixed(1) }}k</span>
+                </div>
+              </div>
+              <div class="cap-hint">账本：{{ costSnapshot.ledger_path }}</div>
+              <div class="cap-actions">
+                <button class="btn btn-secondary" style="font-size:0.78rem" @click="refreshCost">刷新</button>
+                <button class="btn btn-secondary" style="font-size:0.78rem" @click="switchCostCurrency">{{ costSnapshot.currency === 'USD' ? '切换为 CNY' : '切换为 USD' }}</button>
+                <button class="btn btn-secondary" style="font-size:0.78rem" @click="doCostClear">清空费用历史</button>
+              </div>
+            </template>
+          </template>
+
+          <!-- 上下文压缩（billion-context） -->
+          <template v-else-if="capTab === 'context'">
+            <div v-if="!ctxEngine" class="cap-hint">未读取到上下文引擎配置。</div>
+            <template v-else>
+              <div class="cap-note">
+                压缩引擎已替换为 <b>billion-context</b>（移植 acp-kernel）：摘要由模型自己写，
+                引擎负责给消息分配稳定引用、判定何时提示、按成对完整性替换被消费的轮次。
+              </div>
+              <div class="cap-row"><span>上下文窗口</span><span class="cap-val">{{ (ctxEngine.model_context_limit / 1000).toFixed(0) }}k Tokens</span></div>
+              <div class="cap-row"><span>OVER-LIMIT 阈值</span><span class="cap-val">{{ (ctxEngine.max_context_limit_pct * 100).toFixed(0) }}%</span></div>
+              <div class="cap-row"><span>EMERGENCY 阈值</span><span class="cap-val">{{ (ctxEngine.emergency_threshold_pct * 100).toFixed(0) }}%</span></div>
+              <div class="cap-row"><span>首次质量水位</span><span class="cap-val">{{ (ctxEngine.min_context_limit_pct * 100).toFixed(0) }}%</span></div>
+              <div class="cap-row"><span>nudge 增长步长</span><span class="cap-val">{{ (ctxEngine.nudge_growth_tokens / 1000).toFixed(0) }}k Tokens（恒定，不随窗口缩放）</span></div>
+              <div class="cap-row"><span>增长门槛</span><span class="cap-val">{{ (ctxEngine.growth_floor / 1000).toFixed(1) }}k Tokens</span></div>
+              <div class="cap-row"><span>T1 / T2 目标</span><span class="cap-val">{{ (ctxEngine.tier_threshold_1 / 1000).toFixed(0) }}k / {{ (ctxEngine.tier_threshold_2 / 1000).toFixed(0) }}k</span></div>
+              <div class="cap-row"><span>最小可压范围</span><span class="cap-val">{{ ctxEngine.min_compress_range }} 字符</span></div>
+              <div class="cap-row"><span>摘要长度</span><span class="cap-val">{{ ctxEngine.min_summary_length }} ~ {{ ctxEngine.max_summary_length }} 字符</span></div>
+              <div class="cap-row"><span>保留最近</span><span class="cap-val">{{ ctxEngine.preserve_recent_messages }} 条 / {{ ctxEngine.preserve_recent_tokens }} Tokens</span></div>
+              <div class="cap-row"><span>分级压缩（T2/T3）</span><span class="cap-val">{{ ctxEngine.tiers_enabled ? '已开启' : '已关闭' }}</span></div>
+              <div class="cap-actions"><button class="btn btn-secondary" style="font-size:0.78rem" @click="refreshCtxEngine">刷新</button></div>
+            </template>
+          </template>
+
+          <!-- 长期记忆（dsh-memory-protocol） -->
+          <template v-else-if="capTab === 'memory'">
+            <div class="cap-note">
+              记忆协议：<b>每轮先查记忆再动手</b>（轮首自动 weave 并把结果注入上下文），轮末自动归档本轮内容。
+              记忆工具自身永远放行；后端不可用时按<b>失败开放</b>降级，不会把应用锁死。
+            </div>
+            <template v-if="memoryConfig">
+              <label class="cap-check"><input type="checkbox" :checked="memoryConfig.enabled" @change="onMemoryToggle('enabled', $event)"><span>启用长期记忆</span></label>
+              <label class="cap-check"><input type="checkbox" :checked="memoryConfig.inject_weave" @change="onMemoryToggle('inject_weave', $event)"><span>轮首自动查阅并注入</span></label>
+              <label class="cap-check"><input type="checkbox" :checked="memoryConfig.enforce_weave" @change="onMemoryToggle('enforce_weave', $event)"><span>硬门：未查记忆则拒绝非记忆工具</span></label>
+              <label class="cap-check"><input type="checkbox" :checked="memoryConfig.auto_ingest" @change="onMemoryToggle('auto_ingest', $event)"><span>轮末自动归档本轮内容</span></label>
+              <label class="cap-check"><input type="checkbox" :checked="memoryConfig.fail_open" @change="onMemoryToggle('fail_open', $event)"><span>失败开放（后端不可用时放行并提示）</span></label>
+            </template>
+            <div class="cap-row"><span>记忆条数</span><span class="cap-val">{{ memoryStatus?.records ?? 0 }}</span></div>
+            <div class="cap-row"><span>存储位置</span><span class="cap-val cap-mono">{{ memoryStatus?.file }}</span></div>
+            <div v-if="memoryRecords.length" class="cap-list">
+              <div v-for="r in memoryRecords" :key="r.id" class="cap-list-item">
+                <span class="cap-badge">{{ r.kind }}</span>
+                <span class="cap-list-text">{{ r.text }}</span>
+              </div>
+            </div>
+            <div v-else class="cap-hint">暂无记忆记录。</div>
+            <div class="cap-actions">
+              <button class="btn btn-secondary" style="font-size:0.78rem" @click="refreshMemory">刷新</button>
+              <button class="btn btn-secondary" style="font-size:0.78rem" @click="doMemoryClear">清空全部记忆</button>
+            </div>
+          </template>
+
+          <!-- 规则引擎（dsh-rule-engine） -->
+          <template v-else-if="capTab === 'rules'">
+            <div v-if="!rulesInfo" class="cap-hint">未读取到规则。请在 {{ '$DSH_HOME' }}/AGENTS.md 中编写规则。</div>
+            <template v-else>
+              <div class="cap-note">
+                规则引擎把 <b>AGENTS.md</b> 里的规则机械化：等级 → 动作（A 拒绝 / B 纠正 / C 询问 / D 自证 / M 元规则），
+                低置信规则永不硬拦。已在 Agent 循环的<b>工具执行前</b>接入硬门。
+              </div>
+              <div class="cap-row"><span>规则总数</span><span class="cap-val">{{ rulesInfo.total }}</span></div>
+              <div class="cap-row"><span>进入硬门</span><span class="cap-val">{{ rulesInfo.guard_rules }}</span></div>
+              <div class="cap-row"><span>置信分布</span><span class="cap-val">high {{ rulesInfo.by_confidence?.high || 0 }} · medium {{ rulesInfo.by_confidence?.medium || 0 }} · low {{ rulesInfo.by_confidence?.low || 0 }}</span></div>
+              <div class="cap-row"><span>规则文件</span><span class="cap-val cap-mono">{{ rulesInfo.rules_path }}</span></div>
+              <div v-if="rulesInfo.rules?.length" class="cap-table">
+                <div class="cap-th"><span>规则</span><span>等级</span><span>动作</span><span>置信</span></div>
+                <div v-for="r in rulesInfo.rules.slice(0, 20)" :key="r.id" class="cap-tr">
+                  <span>[{{ r.id }}] {{ r.title }}</span>
+                  <span>{{ r.level || '—' }}</span>
+                  <span>{{ (r.actions || []).join('/') }}</span>
+                  <span>{{ r.confidence }}</span>
+                </div>
+              </div>
+              <div class="cap-sub">最近审计</div>
+              <div v-if="rulesAudit.length" class="cap-list">
+                <div v-for="(a, i) in rulesAudit.slice(0, 12)" :key="i" class="cap-list-item">
+                  <span class="cap-badge" :class="{ deny: a.kind === 'deny' }">{{ a.kind }}</span>
+                  <span class="cap-list-text">[{{ a.rule }}] {{ a.tool }} — {{ a.reason }}</span>
+                </div>
+              </div>
+              <div v-else class="cap-hint">暂无审计记录。</div>
+            </template>
+            <div class="cap-actions"><button class="btn btn-secondary" style="font-size:0.78rem" @click="refreshRules">刷新</button></div>
+          </template>
+
+          <!-- 插件体检（dsh-plugin-vet） -->
+          <template v-else>
+            <div class="cap-note">
+              插件体检：确定性静态扫描 → 两段式评分卡（静态分与人工审计结论<b>刻意不合并</b>）。
+              权重 critical 45 / high 20 / medium 8 / info 0，<b>只有非 heuristic 发现能改变判决</b>。
+            </div>
+            <div class="config-field">
+              <label>待体检的插件包目录或文件</label>
+              <input v-model="vetTarget" placeholder="如 D:\\projects\\some-plugin">
+            </div>
+            <div class="cap-actions">
+              <button class="btn btn-primary" style="font-size:0.78rem" :disabled="vetBusy" @click="doVetScan">{{ vetBusy ? '扫描中…' : '开始体检' }}</button>
+              <button class="btn btn-secondary" style="font-size:0.78rem" @click="vetTarget = store.currentProject || ''">用当前项目</button>
+            </div>
+            <pre v-if="vetScorecard" class="cap-pre">{{ vetScorecard }}</pre>
+          </template>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -677,6 +941,7 @@
 import { ref, onMounted, nextTick, watch, computed } from "vue";
 import { useAppStore, MAX_PASTE_IMAGES, type LogKind } from "../stores/app";
 import { tauriAPI } from "../services/tauri-api";
+import type { GitGraphCommit, GitGraphLaneRow, LaneGlyph } from "../services/tauri-api";
 import FileTreeNode from "../components/layout/FileTreeNode.vue";
 import { createEditor, destroyEditor, getEditorContent, setEditorContent, setEditorLanguage, setEditorTheme } from "../utils/codemirror";
 import type { EditorView } from "@codemirror/view";
@@ -700,6 +965,8 @@ const showSettings = ref(false);
 const showAIConfigModal = ref(false);
 const showMarketplace = ref(false);
 const showGitPushModal = ref(false);
+const showGitHistoryModal = ref(false);
+const showCapModal = ref(false);
 const showFilePicker = ref(false);
 const showTerminal = ref(false);
 const showImagePreview = ref(false);
@@ -844,6 +1111,33 @@ const inlineInputRef = ref<HTMLInputElement | null>(null);
 const apiKeyInput = ref("");
 const baseUrlInput = ref("https://api.deepseek.com");
 const modelInput = ref("deepseek-chat");
+
+// ─── 主模型：只支持 DeepSeek 模型 ───
+const DEEPSEEK_MODELS = [
+  { id: "deepseek-chat",     label: "deepseek-chat（DeepSeek V4 通用 · Agent/工具调用）" },
+  { id: "deepseek-reasoner", label: "deepseek-reasoner（DeepSeek V4 推理 · thinking）" },
+  { id: "deepseek-coder",    label: "deepseek-coder（代码专用）" },
+  { id: "deepseek-vl",       label: "deepseek-vl（多模态识图，可选）" },
+];
+/** 仅当主模型名包含 deepseek 时才被接受（含代理前缀写法，如 deepseek-ai/DeepSeek-V4） */
+function isDeepSeekModel(name: string): boolean {
+  return /deepseek/i.test((name || "").trim());
+}
+/** 下拉选中项：命中预设则用预设 id，否则进入"自定义" */
+const modelPreset = computed(() =>
+  DEEPSEEK_MODELS.some(m => m.id === modelInput.value) ? modelInput.value : "__custom__"
+);
+function onModelPresetChange(e: Event) {
+  const v = (e.target as HTMLSelectElement).value;
+  if (v === "__custom__") {
+    if (isDeepSeekModel(modelInput.value) && DEEPSEEK_MODELS.some(m => m.id === modelInput.value)) {
+      modelInput.value = "";
+    }
+    return;
+  }
+  modelInput.value = v;
+}
+
 const termInput = ref("");
 const terminalLines = ref<{ type: string; text: string }[]>([]);
 const runtimes = ref<{name:string;version:string|null;available:boolean;path:string|null}[]>([]);
@@ -864,6 +1158,103 @@ const multimodalEnabled = ref(false);
 const maxMode = ref(true);
 // 上下文窗口输入（AI 配置面板）
 const contextLimitInput = ref(store.contextLimit);
+
+// ─── 集成能力面板：费用统计 / 上下文引擎 / 长期记忆 / 规则引擎 / 插件体检 ───
+const costSnapshot = ref<any>(null);
+const ctxEngine = ref<any>(null);
+const memoryConfig = ref<any>(null);
+const memoryStatus = ref<any>(null);
+const memoryRecords = ref<any[]>([]);
+const rulesInfo = ref<any>(null);
+const rulesAudit = ref<any[]>([]);
+const vetTarget = ref("");
+const vetReport = ref<any>(null);
+const vetScorecard = ref("");
+const vetBusy = ref(false);
+const capTab = ref("cost");
+
+async function refreshCost() {
+  try { costSnapshot.value = await tauriAPI.costSnapshot(); } catch (_) { costSnapshot.value = null; }
+}
+async function refreshCtxEngine() {
+  try { ctxEngine.value = await tauriAPI.contextEngineConfig(store.contextLimit); } catch (_) { ctxEngine.value = null; }
+}
+async function refreshMemory() {
+  try {
+    memoryConfig.value = await tauriAPI.getMemoryConfig();
+    memoryStatus.value = await tauriAPI.memoryStatus();
+    const r = await tauriAPI.memoryRecent(20);
+    memoryRecords.value = r.records || [];
+  } catch (_) { memoryConfig.value = null; }
+}
+async function refreshRules() {
+  try {
+    rulesInfo.value = await tauriAPI.rulesLoad();
+    const a = await tauriAPI.rulesAudit(30);
+    rulesAudit.value = a.records || [];
+  } catch (_) { rulesInfo.value = null; }
+}
+/** 加载全部集成能力面板数据 */
+async function refreshCapabilities() {
+  await Promise.all([refreshCost(), refreshCtxEngine(), refreshMemory(), refreshRules()]);
+}
+async function onMemoryToggle(key: string, e: Event) {
+  const val = (e.target as HTMLInputElement).checked;
+  try {
+    memoryConfig.value = await tauriAPI.setMemoryConfig({ [key]: val } as any);
+    store.appendLog("system", `长期记忆 ${key} → ${val ? "开启" : "关闭"}`);
+  } catch (err: any) { alert("更新记忆配置失败: " + err); }
+}
+async function doMemoryClear() {
+  const ok = await showInlineConfirm("清空长期记忆", "将删除全部长期记忆记录（不可恢复）。确定继续吗？");
+  if (!ok) return;
+  try {
+    const n = await tauriAPI.memoryClear();
+    store.appendLog("system", `已清空长期记忆（${n} 条）`);
+    await refreshMemory();
+  } catch (e: any) { alert("清空失败: " + e); }
+}
+async function doVetScan() {
+  const t = vetTarget.value.trim() || store.currentProject || "";
+  vetTarget.value = t;
+  if (!t) { alert("请填写要体检的插件包目录或文件路径。"); return; }
+  vetBusy.value = true;
+  vetScorecard.value = "";
+  vetReport.value = null;
+  try {
+    const r = await tauriAPI.vetScan(t);
+    vetReport.value = r.report;
+    vetScorecard.value = r.scorecard;
+    store.appendLog(
+      "system",
+      `插件体检完成：${r.report.verdict}（staticScore ${r.report.static_score}）`,
+      `${r.report.findings?.length || 0} 条静态发现 · ${r.report.source_count} 个文件`
+    );
+  } catch (e: any) {
+    alert("体检失败: " + e);
+  } finally {
+    vetBusy.value = false;
+  }
+}
+/** 切换计价币种（会触发按新币种重新计价） */
+async function switchCostCurrency() {
+  const next = costSnapshot.value?.currency === "USD" ? "CNY" : "USD";
+  try {
+    await tauriAPI.costSetConfig({ currency: next, symbol: next === "CNY" ? "¥" : "$" });
+    await refreshCost();
+    store.appendLog("system", `费用计价币种切换为 ${next}`);
+  } catch (e: any) { alert("切换币种失败: " + e); }
+}
+/** 清空费用历史 */
+async function doCostClear() {
+  const ok = await showInlineConfirm("清空费用历史", "将删除账本中全部按天/按会话的费用记录（本地记忆与日志不受影响）。确定继续吗？");
+  if (!ok) return;
+  try {
+    const r = await tauriAPI.costClear();
+    store.appendLog("system", `已清空费用历史（${r.cleared_days} 天）`);
+    await refreshCost();
+  } catch (e: any) { alert("清空失败: " + e); }
+}
 
 /**
  * 当前连接的模型本身是否具备多模态（识图）能力。
@@ -931,6 +1322,113 @@ const gitRemoteRepo = ref("");
 const gitBranch = ref("main");
 const gitCommitMsg = ref("");
 const gitStatusArea = ref("");
+
+// ─── Git 面板 · 历史提交记录（集成 dsh-git-graph）───
+const gitHistoryPath = ref("");
+const gitGraphCommits = ref<GitGraphCommit[]>([]);
+const gitGraphRows = ref<GitGraphLaneRow[]>([]);
+const gitGraphCount = ref(200);
+const gitGraphHasMore = ref(false);
+const gitGraphBranch = ref("");
+const gitGraphLoading = ref(false);
+const gitGraphError = ref("");
+const gitGraphSelected = ref<string | null>(null);
+const gitGraphDetail = ref<{ hash: string; stat: string; files: string[]; patch: string } | null>(null);
+
+/**
+ * 提交图泳道算法 —— 移植自 dsh-git-graph 的 `computeLanes`
+ * （packages/dsh-git-graph/src/core/types.ts）。
+ *
+ * 单遍贪心"待定泳道"算法。前提：rows 已按拓扑序排列（子提交严格早于父提交出现），
+ * 由 `git log --topo-order` 保证。
+ *
+ * 状态：`lanes[i]` = 第 i 条泳道正在等待出现的提交 oid（null = 空位/断口）；
+ *       `later` = 所有行的全部父提交之并集。
+ *
+ * 每行处理：
+ *  1. nodeColumn = lanes 中等于本行 oid 的位置；没有则**追加到最右**（分支头）
+ *  2. 逐列判定字形：
+ *       待定为 null              → 'gap'
+ *       i === nodeColumn         → 父提交多于一个 ? 'merge' : 'node'
+ *       待定 === 本行 oid（且不是 nodeColumn）→ 'gap'（合并汇入：另一条等待同一提交的泳道到此终止）
+ *       later 含该待定提交        → 'pass'（该泳道继续向下）
+ *       否则                     → 'gap'
+ *  3. 过滤出存在于 later 中的父提交（first + rest）
+ *  4. 清空汇入的重复泳道（等待本行 oid 但非 nodeColumn 的）
+ *  5. lanes[nodeColumn] = first ?? null（首父继承当前泳道）
+ *  6. rest 中尚未在任何泳道等待的父提交 → 追加新泳道
+ *  7. 只裁剪**尾部**空位
+ */
+function computeLanes(rows: GitGraphCommit[]): GitGraphLaneRow[] {
+  const lanes: (string | null)[] = [];
+  // 所有行的全部父提交之并集
+  const later = new Set<string>();
+  for (const r of rows) for (const p of r.parents) later.add(p);
+
+  const out: GitGraphLaneRow[] = [];
+  for (const row of rows) {
+    // 1. 定位本行提交所在泳道（分支头追加到最右）
+    let nodeColumn = lanes.findIndex((p) => p === row.oid);
+    if (nodeColumn === -1) {
+      lanes.push(row.oid);
+      nodeColumn = lanes.length - 1;
+    }
+
+    // 2. 逐列判定字形
+    const columns: LaneGlyph[] = [];
+    for (let i = 0; i < lanes.length; i++) {
+      const pending = lanes[i];
+      if (pending === null) columns.push("gap");
+      else if (i === nodeColumn) columns.push(row.parents.length > 1 ? "merge" : "node");
+      else if (pending === row.oid) columns.push("gap");
+      else if (later.has(pending)) columns.push("pass");
+      else columns.push("gap");
+    }
+
+    // 3. 只保留存在于 later 中的父提交
+    const parents = row.parents.filter((p) => later.has(p));
+    const first = parents.length > 0 ? parents[0] : null;
+    const rest = parents.slice(1);
+
+    // 4. 汇入本提交的重复泳道清空
+    for (let i = 0; i < lanes.length; i++) {
+      if (lanes[i] === row.oid && i !== nodeColumn) lanes[i] = null;
+    }
+    // 5. 首父继承当前泳道
+    lanes[nodeColumn] = first;
+    // 6. 其余父提交开新泳道
+    for (const p of rest) {
+      if (!lanes.includes(p)) lanes.push(p);
+    }
+    // 7. 只裁尾
+    while (lanes.length > 0 && lanes[lanes.length - 1] === null) lanes.pop();
+
+    out.push({ columns, nodeColumn, merge: parents.length > 1 });
+  }
+  return out;
+}
+
+/** 字形 → 字符（对齐上游 GraphDialog） */
+function laneGlyphChar(g: LaneGlyph): string {
+  return g === "node" ? "●" : g === "merge" ? "◆" : g === "pass" ? "│" : " ";
+}
+
+/**
+ * 相对时间（对齐上游）：<60s 刚刚；<1h n 分钟；<24h n 小时；<30d n 天；否则 YYYY-MM-DD
+ */
+function relativeTime(unixSeconds: number): string {
+  if (!unixSeconds) return "";
+  const now = Date.now() / 1000;
+  const diff = now - unixSeconds;
+  if (diff < 60) return "刚刚";
+  if (diff < 3600) return `${Math.floor(diff / 60)} 分钟前`;
+  if (diff < 86400) return `${Math.floor(diff / 3600)} 小时前`;
+  if (diff < 86400 * 30) return `${Math.floor(diff / 86400)} 天前`;
+  const d = new Date(unixSeconds * 1000);
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
 
 // 文件选择器
 const filePickerItems = ref<any[]>([]);
@@ -1012,11 +1510,13 @@ onMounted(async () => {
       const cfg = JSON.parse(apiConfig);
       apiKeyInput.value = cfg.apiKey || "";
       baseUrlInput.value = cfg.baseUrl || "https://api.deepseek.com";
-      modelInput.value = cfg.model || "deepseek-chat";
+      // 主模型只支持 DeepSeek 模型：历史配置里的非 DeepSeek 模型回退为默认值
+      const savedModel = String(cfg.model || "");
+      modelInput.value = isDeepSeekModel(savedModel) ? savedModel : "deepseek-chat";
       if (cfg.apiKey) {
         store.apiKey = cfg.apiKey;
         store.baseUrl = cfg.baseUrl || "https://api.deepseek.com";
-        store.model = cfg.model || "deepseek-chat";
+        store.model = modelInput.value;
         await store.configureApiKey(cfg.apiKey);
       }
     } catch (_) {}
@@ -1502,7 +2002,65 @@ function confirmFilePicker() {
 watch(showFilePicker, async (v) => { if (v) await loadFilePicker(store.currentProject || "."); });
 function removeContextFile(idx: number) { aiContextFiles.value.splice(idx, 1); }
 
-// ─── Git Push ───
+// ─── Git 面板：Git 提交 / 历史提交记录（集成 git-graph）───
+/** Git 提交面板（原「Git 推送」） */
+function openGitCommitPanel() {
+  closeDropdowns();
+  gitLocalPath.value = gitLocalPath.value || store.currentProject || "";
+  showGitPushModal.value = true;
+}
+/** 历史提交记录面板：加载提交图并计算泳道布局 */
+async function openGitHistoryPanel() {
+  closeDropdowns();
+  gitHistoryPath.value = gitLocalPath.value || store.currentProject || "";
+  showGitHistoryModal.value = true;
+  await loadGitGraph();
+}
+async function loadGitGraph() {
+  gitGraphLoading.value = true;
+  gitGraphError.value = "";
+  try {
+    const view = await tauriAPI.gitLogGraph(gitHistoryPath.value || ".", gitGraphCount.value, true);
+    gitGraphCommits.value = view.commits || [];
+    gitGraphBranch.value = view.branch || "";
+    gitGraphHasMore.value = !!view.has_more;
+    gitGraphRows.value = computeLanes(gitGraphCommits.value);
+    gitGraphSelected.value = null;
+    gitGraphDetail.value = null;
+  } catch (e: any) {
+    gitGraphError.value = String(e);
+    gitGraphCommits.value = [];
+    gitGraphRows.value = [];
+    gitGraphHasMore.value = false;
+  } finally {
+    gitGraphLoading.value = false;
+  }
+}
+/** 加载更多（对齐上游：初始 200，每次 +100） */
+async function loadMoreGitGraph() {
+  gitGraphCount.value = Math.min(gitGraphCount.value + 100, 5000);
+  await loadGitGraph();
+}
+/** 当前分支/HEAD 指向的引用高亮（对齐上游 graphRefCurrent） */
+function isCurrentRef(ref: string): boolean {
+  return !!gitGraphBranch.value && ref === gitGraphBranch.value;
+}
+/** 展开某条提交：读取改动详情 */
+async function selectGitCommit(row: GitGraphCommit) {
+  if (gitGraphSelected.value === row.oid) {
+    gitGraphSelected.value = null;
+    gitGraphDetail.value = null;
+    return;
+  }
+  gitGraphSelected.value = row.oid;
+  gitGraphDetail.value = null;
+  try {
+    gitGraphDetail.value = await tauriAPI.gitCommitDetail(gitHistoryPath.value || ".", row.oid);
+  } catch (e: any) {
+    gitGraphDetail.value = { hash: row.oid, stat: String(e), files: [], patch: "" };
+  }
+}
+
 async function selectGitLocalPath() {
   const dir = await open({ directory: true });
   if (dir) gitLocalPath.value = dir;
@@ -1723,9 +2281,17 @@ function autoResizeAIInput() {
 }
 function saveAIConfig() { saveApiConfig(); } // deprecated, kept for ref
 async function saveApiConfig() {
-  store.baseUrl = baseUrlInput.value; store.model = modelInput.value;
+  // 主模型只支持 DeepSeek 模型
+  const m = (modelInput.value || "").trim();
+  if (!m) { alert("请选择 DeepSeek 主模型。"); return; }
+  if (!isDeepSeekModel(m)) {
+    alert(`主模型只支持 DeepSeek 模型，当前填写的是「${m}」。\n请从下拉列表选择，或填写包含 deepseek 的模型名（如 deepseek-chat / deepseek-reasoner）。`);
+    return;
+  }
+  modelInput.value = m;
+  store.baseUrl = baseUrlInput.value; store.model = m;
   localStorage.setItem("deep-ide-api-config", JSON.stringify({
-    apiKey: apiKeyInput.value, baseUrl: baseUrlInput.value, model: modelInput.value,
+    apiKey: apiKeyInput.value, baseUrl: baseUrlInput.value, model: m,
   }));
   await store.configureApiKey(apiKeyInput.value);
   await store.switchMode(store.currentMode);
@@ -1760,9 +2326,15 @@ function toggleMultimodal(e: Event) {
     alert("已开启视觉引擎，但尚未填写 Vision API Key。\n请填写下方「视觉引擎」配置（引擎 / Vision API Key / Base URL / Model）后点击「保存视觉引擎」。");
   }
 }
+/** 打开集成能力面板并加载全部数据 */
+async function openCapabilities() {
+  showCapModal.value = true;
+  await refreshCapabilities();
+}
 async function openAIConfig() {
   contextLimitInput.value = store.contextLimit;
   await loadVisionConfig();
+  await refreshCapabilities();
   showAIConfigModal.value = true;
 }
 async function saveVisionConfig() {

@@ -27,6 +27,136 @@ pub struct GitDiffResult {
     pub diff: String,
 }
 
+/// 提交图节点：对应上游 dsh-git-graph 的 GraphCommit
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GitGraphCommit {
+    pub oid: String,
+    pub short: String,
+    /// 父提交（merge 时有多个）——computeLanes 的分支/合并判定依据
+    pub parents: Vec<String>,
+    pub author: String,
+    /// 作者时间（Unix 秒，%at）——前端据此计算相对时间，避免格式化后二次解析
+    pub author_time: i64,
+    pub subject: String,
+    /// 解析后的引用（已去掉 HEAD -> / tag: 前缀）
+    pub refs: Vec<String>,
+}
+
+/// 提交图视图（含分页信息）
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GitGraphView {
+    pub branch: String,
+    pub commits: Vec<GitGraphCommit>,
+    pub has_more: bool,
+}
+
+/// 解析 `%D` 装饰串（对齐上游 parseDecoration）：
+/// 按 ", " 切分，丢弃裸 "HEAD"，去掉 "HEAD -> " 与 "tag: " 前缀，去空白与空项。
+fn parse_decoration(d: &str) -> Vec<String> {
+    d.split(", ")
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty() && *s != "HEAD")
+        .map(|s| {
+            let s = s.strip_prefix("HEAD -> ").unwrap_or(s);
+            let s = s.strip_prefix("tag: ").unwrap_or(s);
+            s.trim().to_string()
+        })
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// 读取提交图数据。
+/// 与上游 dsh-git-graph 一致：
+/// - `--topo-order --parents`（拓扑序是泳道算法的前提）
+/// - 记录用 \x1e 分隔、字段用 \x00 分隔，避免提交信息中的字符冲突
+/// - 多取一条（limit+1）来判断 hasMore，而不是再跑一次 rev-list --count
+#[tauri::command]
+pub fn git_log_graph(
+    path: String,
+    count: Option<usize>,
+    all: Option<bool>,
+) -> Result<GitGraphView, String> {
+    let limit = count.unwrap_or(200).clamp(1, 5000);
+    let branch = run_git(&path, &["rev-parse", "--abbrev-ref", "HEAD"])
+        .trim()
+        .to_string();
+
+    // %x00 字段分隔，%x1e 记录分隔
+    let format = "--format=%H%x00%P%x00%an%x00%at%x00%D%x00%s%x1e";
+    let mut args: Vec<String> = vec!["log".into(), format.into()];
+    if all.unwrap_or(true) {
+        args.push("--branches".into());
+        args.push("--tags".into());
+        args.push("--remotes".into());
+    }
+    args.push("--topo-order".into());
+    args.push("--parents".into());
+    args.push(format!("--max-count={}", limit + 1));
+    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+
+    let output = run_git(&path, &arg_refs);
+
+    let mut commits: Vec<GitGraphCommit> = Vec::new();
+    for record in output.split('\u{1e}') {
+        // git 的 tformat 会在记录分隔符后附加一个换行，必须剥掉，否则 oid 被污染
+        let record = record.strip_prefix('\n').unwrap_or(record);
+        let record = record.trim_end_matches(['\n', '\r']);
+        if record.trim().is_empty() {
+            continue;
+        }
+        let f: Vec<&str> = record.split('\u{0}').collect();
+        if f.len() < 6 {
+            continue;
+        }
+        let oid = f[0].trim().to_string();
+        if oid.is_empty() {
+            continue;
+        }
+        let parents: Vec<String> = f[1].split_whitespace().map(|p| p.to_string()).collect();
+        commits.push(GitGraphCommit {
+            short: oid.chars().take(7).collect(),
+            oid,
+            parents,
+            author: f[2].to_string(),
+            author_time: f[3].trim().parse::<i64>().unwrap_or(0),
+            refs: parse_decoration(f[4]),
+            subject: f[5].to_string(),
+        });
+    }
+
+    let has_more = commits.len() > limit;
+    if has_more {
+        commits.truncate(limit);
+    }
+
+    Ok(GitGraphView { branch, commits, has_more })
+}
+
+/// 单个提交的改动详情（「历史提交记录」里点开某条提交时使用）
+#[tauri::command]
+pub fn git_commit_detail(path: String, hash: String) -> Result<serde_json::Value, String> {
+    let stat = run_git(&path, &["show", "--stat", "--oneline", &hash]);
+    let files_out = run_git(&path, &["show", "--name-only", "--pretty=format:", &hash]);
+    let files: Vec<String> = files_out
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    let patch = run_git(&path, &["show", "--pretty=format:", "--patch", &hash]);
+    // 限制 patch 体积，避免超大提交把前端卡死
+    let patch = if patch.len() > 200_000 {
+        format!("{}\n... [patch truncated, {} chars total]", &patch[..200_000], patch.len())
+    } else {
+        patch
+    };
+    Ok(serde_json::json!({
+        "hash": hash,
+        "stat": stat,
+        "files": files,
+        "patch": patch,
+    }))
+}
+
 /// Git 状态
 #[tauri::command]
 pub fn git_status(path: String) -> Result<GitStatus, String> {

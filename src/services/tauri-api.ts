@@ -25,6 +25,32 @@ export interface DirListResult { entries: FileEntry[]; path: string; }
 export interface GitStatus { branch: string; changes: string[]; staged: string[]; untracked: string[]; ahead: number; behind: number; clean: boolean; }
 export interface GitLogEntry { hash: string; author: string; date: string; message: string; }
 export interface GitDiffResult { files: string[]; diff: string; }
+/** 提交图节点（对应上游 dsh-git-graph 的 GraphCommit） */
+export interface GitGraphCommit {
+  oid: string;
+  short: string;
+  parents: string[];
+  author: string;
+  /** 作者时间（Unix 秒，%at） */
+  author_time: number;
+  subject: string;
+  /** 解析后的引用（已去掉 HEAD -> / tag: 前缀） */
+  refs: string[];
+}
+/** 提交图视图（含分页信息） */
+export interface GitGraphView {
+  branch: string;
+  commits: GitGraphCommit[];
+  has_more: boolean;
+}
+/** 泳道字形（对齐上游 LaneGlyph） */
+export type LaneGlyph = "node" | "pass" | "merge" | "gap";
+/** 一行的泳道布局（对齐上游 GraphRowLanes） */
+export interface GitGraphLaneRow {
+  columns: LaneGlyph[];
+  nodeColumn: number;
+  merge: boolean;
+}
 
 export interface SSHConfig { host: string; port: number; username: string; password?: string; key_path?: string; }
 export interface SSHExecResult { stdout: string; stderr: string; exit_code: number; }
@@ -40,6 +66,15 @@ export interface VisionResult { text: string; provider: string; image_path: stri
 
 // ─── 上下文占用 + 压缩 ───
 export interface ContextUsage { tokens: number; limit: number; ratio: number; }
+/** 长期记忆配置（dsh-memory-protocol 移植） */
+export interface MemoryConfigInfo {
+  enabled: boolean;
+  enforce_weave: boolean;
+  inject_weave: boolean;
+  auto_ingest: boolean;
+  allowlist: string[];
+  fail_open: boolean;
+}
 export interface CompressResult {
   before_tokens: number;
   after_tokens: number;
@@ -126,6 +161,12 @@ export const tauriAPI = {
   gitBranches: (path: string) => invoke<string[]>("git_branches", { path }),
   gitClone: (url: string, target: string, proxy?: string) => invoke<string>("git_clone", { url, target, proxy: proxy||null }),
   gitPush: (path: string, username: string, token: string, repo: string, branch: string, message: string) => invoke<string>("git_push", { path, username, token, repo, branch, message }),
+  /** 提交图数据（「历史提交记录」的 git-graph 视图） */
+  gitLogGraph: (path: string, count?: number, all?: boolean) =>
+    invoke<GitGraphView>("git_log_graph", { path, count: count ?? 200, all: all ?? true }),
+  /** 单个提交的改动详情 */
+  gitCommitDetail: (path: string, hash: string) =>
+    invoke<{ hash: string; stat: string; files: string[]; patch: string }>("git_commit_detail", { path, hash }),
 
   // ─── SSH ───
   sshTest: (config: SSHConfig) => invoke<string>("ssh_test_connection", { config }),
@@ -145,6 +186,39 @@ export const tauriAPI = {
   compressContext: (messages: { role: string; content: string }[], maxTokens: number, preserveRecentTurns = 4) =>
     invoke<CompressResult>("compress_context", { messages, maxTokens, preserveRecentTurns }),
   getContextConfig: () => invoke<{ max_tokens: number; compression_threshold: number; preserve_recent_turns: number }>("get_context_config"),
+  /** billion-context 引擎阈值（移植版） */
+  contextEngineConfig: (contextLimit?: number) => invoke<Record<string, any>>("context_engine_config", { contextLimit: contextLimit ?? null }),
+
+  // ─── 长期记忆协议（dsh-memory-protocol 移植）───
+  getMemoryConfig: () => invoke<MemoryConfigInfo>("get_memory_config"),
+  setMemoryConfig: (patch: Partial<MemoryConfigInfo>) => invoke<MemoryConfigInfo>("set_memory_config", patch as any),
+  memoryWeave: (query: string, topK?: number) => invoke<string>("memory_weave", { query, topK: topK ?? null }),
+  memoryIngest: (content: string, role?: string, kind?: string) =>
+    invoke<any>("memory_ingest", { content, role: role ?? null, kind: kind ?? null }),
+  memorySearch: (query: string, limit?: number) =>
+    invoke<{ hits: { id: string; kind: string; text: string; role: string; created_at: number; score: number }[] }>(
+      "memory_search", { query, limit: limit ?? null }),
+  memoryStatus: () => invoke<{ records: number; dir: string; file: string; available: boolean }>("memory_status"),
+  memoryRecent: (limit?: number) => invoke<{ records: any[] }>("memory_recent", { limit: limit ?? null }),
+  memoryClear: () => invoke<number>("memory_clear"),
+
+  // ─── 插件体检（dsh-plugin-vet 移植）───
+  vetScan: (target: string) => invoke<{ report: any; scorecard: string }>("vet_scan", { target }),
+  vetWriteHealthRecord: (target: string, name?: string, version?: string, risk?: string, recommendation?: string, notes?: string) =>
+    invoke<string>("vet_write_health_record", { target, name: name ?? null, version: version ?? null, risk: risk ?? null, recommendation: recommendation ?? null, notes: notes ?? null }),
+  vetListRecords: () => invoke<{ records: string[] }>("vet_list_records"),
+
+  // ─── 规则引擎（dsh-rule-engine 移植）───
+  rulesLoad: () => invoke<any>("rules_load"),
+  rulesParse: (text: string) => invoke<any>("rules_parse", { text }),
+  rulesAudit: (limit?: number) => invoke<{ records: any[]; path: string }>("rules_audit", { limit: limit ?? null }),
+  rulesTestGuard: (tool: string, args?: any, userText?: string) =>
+    invoke<any>("rules_test_guard", { tool, arguments: args ?? null, userText: userText ?? null }),
+
+  // ─── 费用统计（dsh-cost-meter 移植）───
+  costSnapshot: () => invoke<Record<string, any>>("cost_snapshot"),
+  costSetConfig: (patch: Record<string, any>) => invoke<Record<string, any>>("cost_set_config", patch),
+  costClear: () => invoke<{ cleared_days: number }>("cost_clear"),
 
   // ─── 会话 ───
   saveSession: (id: string, name: string, mode: string, agent: string, messages: Message[], totalTokens: number) => invoke<string>("save_session", { id, name, mode, agent, messages, totalTokens }),
